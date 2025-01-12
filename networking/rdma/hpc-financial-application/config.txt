@@ -1,0 +1,7 @@
+client_dev_name = siwdev1
+server_dev_name = siwdev2
+
+server_ip = 10.0.1.6
+server_port = 5757
+
+data_file = "fdata.txt"
