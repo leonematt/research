@@ -10,3 +10,7 @@ gunicorn
 requests
 tqdm
 pyarrow
+mlflow
+hyperopt
+xgboost
+setuptools
