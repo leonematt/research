@@ -2,125 +2,239 @@
 set -e
 
 echo "========================================"
-echo "Starting ML Zoomcamp Environment Setup"
+echo "Starting ML Zoomcamp Environment Setup (User-Local)"
 echo "========================================"
 
-# 1. Update system packages
-echo "[1/9] Checking system packages (curl, wget, git, bzip2, openssl)..."
-sudo apt-get update -y -qq
-sudo apt-get install -y curl wget git bzip2 openssl -qq
+# All user-local installs go here
+LOCAL_PREFIX="$HOME/.local"
+LOCAL_BIN="$LOCAL_PREFIX/bin"
+mkdir -p "$LOCAL_BIN"
 
-# 2. Install Docker
-echo "[2/9] Checking Docker..."
+# Ensure ~/.local/bin is on PATH for this script only (not persisted)
+export PATH="$LOCAL_BIN:$PATH"
+
+# Project-local paths
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/env.sh"
+PROJECT_JUPYTER_DIR="$SCRIPT_DIR/.jupyter"
+PROJECT_CERT_DIR="$PROJECT_JUPYTER_DIR/certs"
+PROJECT_JUPYTER_CONFIG="$PROJECT_JUPYTER_DIR/jupyter_notebook_config.py"
+
+# 1. Verify required tools are present (no install, no sudo)
+echo "[1/7] Checking required tools (curl, wget, git, bzip2, openssl)..."
+MISSING=()
+for tool in curl wget git bzip2 openssl; do
+    if ! command -v "$tool" &> /dev/null; then
+        MISSING+=("$tool")
+    fi
+done
+if [ ${#MISSING[@]} -gt 0 ]; then
+    echo "⚠️  The following tools are missing: ${MISSING[*]}"
+    echo "    This script does not install system packages. Please install them"
+    echo "    via your OS package manager (or ask your admin) before re-running."
+    exit 1
+fi
+echo "✅ All required tools are present."
+
+# 2. Docker — user-local note
+echo "[2/7] Docker check..."
 if command -v docker &> /dev/null; then
-    echo "✅ Docker is already installed: $(docker --version)"
+    echo "✅ Docker is available: $(docker --version)"
 else
-    echo "⬇️ Installing Docker..."
-    curl -fsSL https://get.docker.com -o get-docker.sh
-    sudo sh get-docker.sh
-    sudo usermod -aG docker $USER
-    rm get-docker.sh
+    echo "ℹ️  Docker is not installed. Docker requires root to install system-wide,"
+    echo "    so this script will not install it. Options:"
+    echo "      • Install Docker Desktop (per-user) from https://www.docker.com/products/docker-desktop/"
+    echo "      • Or use rootless Docker: https://docs.docker.com/engine/security/rootless/"
+    echo "    Continuing without Docker."
 fi
 
-# 3. Install Docker Compose
-echo "[3/9] Checking Docker Compose..."
-if docker compose version &> /dev/null || command -v docker-compose &> /dev/null; then
-    echo "✅ Docker Compose is already installed."
+# 3. Docker Compose — user-local binary
+echo "[3/7] Checking Docker Compose (user-local)..."
+if docker compose version &> /dev/null 2>&1; then
+    echo "✅ Docker Compose plugin is already available."
+elif [ -x "$LOCAL_BIN/docker-compose" ]; then
+    echo "✅ docker-compose already installed at $LOCAL_BIN/docker-compose"
 else
-    echo "⬇️ Installing Docker Compose..."
-    sudo apt-get install -y docker-compose-plugin
-    sudo curl -SL "https://github.com/docker/compose/releases/download/v2.26.1/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose
-    sudo chmod +x /usr/local/bin/docker-compose
+    echo "⬇️  Installing docker-compose to $LOCAL_BIN (user-local)..."
+    UNAME_S="$(uname -s)"
+    UNAME_M="$(uname -m)"
+    curl -fsSL "https://github.com/docker/compose/releases/download/v2.26.1/docker-compose-${UNAME_S}-${UNAME_M}" \
+        -o "$LOCAL_BIN/docker-compose"
+    chmod +x "$LOCAL_BIN/docker-compose"
+    echo "✅ Installed docker-compose to $LOCAL_BIN/docker-compose"
 fi
 
-# 4. Install Miniconda
-echo "[4/9] Checking Miniconda..."
-if [ -d "$HOME/miniconda" ] || command -v conda &> /dev/null; then
-    echo "✅ Conda is already installed."
+# 4. Install Miniconda (user-local)
+echo "[4/7] Checking Miniconda..."
+if [ -d "$HOME/miniconda" ]; then
+    echo "✅ Miniconda already installed at $HOME/miniconda."
 else
-    echo "⬇️ Installing Miniconda..."
-    wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
-    bash miniconda.sh -b -p $HOME/miniconda
+    echo "⬇️  Installing Miniconda to $HOME/miniconda..."
+    UNAME_M="$(uname -m)"
+    case "$UNAME_M" in
+        x86_64)  MC_ARCH="x86_64" ;;
+        aarch64|arm64) MC_ARCH="aarch64" ;;
+        *) echo "❌ Unsupported arch: $UNAME_M"; exit 1 ;;
+    esac
+    wget "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-${MC_ARCH}.sh" -O miniconda.sh
+    bash miniconda.sh -b -p "$HOME/miniconda"
     rm miniconda.sh
 fi
 
-# 5. Initialize Conda
-echo "[5/9] Configuring Conda for Bash and Zsh..."
-# Source activate specifically so this running script can use the conda command below
-source $HOME/miniconda/bin/activate
-conda init bash > /dev/null
-conda init zsh > /dev/null
+# Activate conda just for this script — does NOT touch rc files
+# shellcheck disable=SC1091
+source "$HOME/miniconda/etc/profile.d/conda.sh"
 
-# 6. Accept Anaconda Terms of Service
-echo "[6/9] Accepting Conda Terms of Service..."
-# The '|| true' ensures the script doesn't fail if TOS was already accepted
+# 5. Accept Anaconda Terms of Service
+echo "[5/7] Accepting Conda Terms of Service..."
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main || true
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r || true
 
-# 7. Create Conda Virtual Environment
-echo "[7/9] Checking for ml-zoomcamp conda environment..."
+# 6. Create Conda Virtual Environment
+echo "[6/7] Checking for ml-zoomcamp conda environment..."
 if conda env list | grep -q "ml-zoomcamp"; then
     echo "✅ Conda environment 'ml-zoomcamp' already exists. Updating packages..."
     conda run -n ml-zoomcamp pip install -r requirements.txt
 else
-    echo "⬇️ Creating ml-zoomcamp conda environment..."
+    echo "⬇️  Creating ml-zoomcamp conda environment..."
     conda create -y -n ml-zoomcamp python=3.11
-    echo "⬇️ Installing Python requirements..."
+    echo "⬇️  Installing Python requirements..."
     conda run -n ml-zoomcamp pip install -r requirements.txt
 fi
 
-# 8. Generate Self-Signed Certificate
-echo "[8/9] Generating self-signed SSL certificate..."
-CERT_DIR="$HOME/.jupyter/certs"
-mkdir -p "$CERT_DIR"
+# 7. Generate Self-Signed Certificate + project-local Jupyter config
+echo "[7/7] Generating self-signed SSL certificate and project-local Jupyter config..."
+mkdir -p "$PROJECT_CERT_DIR"
 
-if [ -f "$CERT_DIR/mycert.pem" ] && [ -f "$CERT_DIR/mykey.key" ]; then
-    echo "✅ SSL certificates already exist in $CERT_DIR"
+if [ -f "$PROJECT_CERT_DIR/mycert.pem" ] && [ -f "$PROJECT_CERT_DIR/mykey.key" ]; then
+    echo "✅ SSL certificates already exist in $PROJECT_CERT_DIR"
 else
-    # The -subj flag bypasses the interactive prompts during certificate creation
     openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout "$CERT_DIR/mykey.key" \
-        -out "$CERT_DIR/mycert.pem" \
+        -keyout "$PROJECT_CERT_DIR/mykey.key" \
+        -out "$PROJECT_CERT_DIR/mycert.pem" \
         -subj "/C=US/ST=Oregon/L=Hillsboro/O=MLZoomcamp/OU=Dev/CN=0.0.0.0" 2>/dev/null
-    echo "✅ Created self-signed certificate in $CERT_DIR"
+    chmod 600 "$PROJECT_CERT_DIR/mykey.key"
+    echo "✅ Created self-signed certificate in $PROJECT_CERT_DIR"
 fi
 
-# 9. Configure Jupyter Notebook
-echo "[9/9] Configuring Jupyter Notebook for HTTPS on 0.0.0.0..."
-JUPYTER_CONFIG_DIR="$HOME/.jupyter"
-JUPYTER_CONFIG_FILE="$JUPYTER_CONFIG_DIR/jupyter_notebook_config.py"
+# Write a fresh, self-contained project-local Jupyter config every run.
+# This file is ONLY picked up when JUPYTER_CONFIG_DIR points here (set by env.sh).
+cat > "$PROJECT_JUPYTER_CONFIG" <<EOF
+# ML Zoomcamp project-local Jupyter config.
+# Generated by setup.sh — do not edit by hand; re-run setup.sh to regenerate.
+# This file is only active when JUPYTER_CONFIG_DIR=$PROJECT_JUPYTER_DIR
+# (env.sh sets that for you). Your global ~/.jupyter is untouched.
 
-# Generate default config if it doesn't exist
-conda run -n ml-zoomcamp jupyter notebook --generate-config -y > /dev/null 2>&1 || true
-
-# Append SSL and IP settings if not already present
-if ! grep -q "ML Zoomcamp Auto-Config" "$JUPYTER_CONFIG_FILE" 2>/dev/null; then
-    cat <<EOF >> "$JUPYTER_CONFIG_FILE"
-
-# --- ML Zoomcamp Auto-Config ---
-# Configuration for Jupyter Server (JupyterLab / Notebook v7+)
-c.ServerApp.certfile = u'$CERT_DIR/mycert.pem'
-c.ServerApp.keyfile = u'$CERT_DIR/mykey.key'
+# Jupyter Server (JupyterLab / Notebook v7+)
+c.ServerApp.certfile = u'$PROJECT_CERT_DIR/mycert.pem'
+c.ServerApp.keyfile  = u'$PROJECT_CERT_DIR/mykey.key'
 c.ServerApp.ip = '0.0.0.0'
 c.ServerApp.open_browser = False
+c.ServerApp.root_dir = '$SCRIPT_DIR/assignments'
 
-# Configuration for older Jupyter Notebooks (v6 and below)
-c.NotebookApp.certfile = u'$CERT_DIR/mycert.pem'
-c.NotebookApp.keyfile = u'$CERT_DIR/mykey.key'
+# Older Jupyter Notebook (v6 and below)
+c.NotebookApp.certfile = u'$PROJECT_CERT_DIR/mycert.pem'
+c.NotebookApp.keyfile  = u'$PROJECT_CERT_DIR/mykey.key'
 c.NotebookApp.ip = '0.0.0.0'
 c.NotebookApp.open_browser = False
-# -------------------------------
 EOF
-    echo "✅ Appended HTTPS and 0.0.0.0 settings to $JUPYTER_CONFIG_FILE"
-else
-    echo "✅ Jupyter HTTPS configuration already exists."
+echo "✅ Wrote project-local Jupyter config to $PROJECT_JUPYTER_CONFIG"
+
+# Make sure the assignments dir exists so Jupyter doesn't complain on first launch
+mkdir -p "$SCRIPT_DIR/assignments"
+
+# --- Emit env.sh ---
+echo "Generating $ENV_FILE ..."
+cat > "$ENV_FILE" <<'EOF'
+# ML Zoomcamp environment loader.
+# Usage: source ./env.sh
+#
+# Generated by setup.sh. Does NOT modify your rc files or global Jupyter config.
+# Puts ~/.local/bin on PATH, activates conda env, and points Jupyter at the
+# project-local config directory for this shell only.
+
+# Guard against executing instead of sourcing
+if [ "${BASH_SOURCE[0]}" = "$0" ] 2>/dev/null; then
+    echo "env.sh must be sourced, not executed: run  source ./env.sh" >&2
+    exit 1
 fi
 
+# Resolve the directory this file lives in (works for bash + zsh)
+_ENV_SH_DIR="$( cd "$( dirname "${BASH_SOURCE[0]:-${(%):-%x}}" )" && pwd )"
+
+# 1. PATH for user-local binaries (docker-compose lives here)
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+
+# 2. Initialize conda for this shell only (no rc changes)
+if [ -f "$HOME/miniconda/etc/profile.d/conda.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$HOME/miniconda/etc/profile.d/conda.sh"
+else
+    echo "env.sh: miniconda not found at \$HOME/miniconda — did setup.sh run successfully?" >&2
+    return 1
+fi
+
+# 3. Activate the project conda environment
+conda activate ml-zoomcamp
+
+# 4. Point Jupyter at the project-local config (leaves global ~/.jupyter alone)
+export JUPYTER_CONFIG_DIR="$_ENV_SH_DIR/.jupyter"
+
+# 5. Remember the project dir for the helper functions below
+export MLZOOMCAMP_PROJECT_DIR="$_ENV_SH_DIR"
+
+# 6. Helper functions — exported so they're available in the shell.
+#    Using functions (not aliases) so they work in non-interactive shells too.
+start-jupyter() {
+    ( cd "$MLZOOMCAMP_PROJECT_DIR" && jupyter notebook "$@" )
+}
+
+start-mlflow() {
+    ( cd "$MLZOOMCAMP_PROJECT_DIR" && \
+      mkdir -p ./mlruns ./artifacts && \
+      mlflow ui \
+        --backend-store-uri ./mlruns \
+        --default-artifact-root ./artifacts \
+        --host 0.0.0.0 \
+        --allowed-hosts "*" \
+        --cors-allowed-origins "*" \
+        "$@" )
+}
+
+# bash exports functions with `export -f`; zsh exports them automatically.
+# The `2>/dev/null || true` keeps zsh (which doesn't have `export -f`) quiet.
+export -f start-jupyter start-mlflow 2>/dev/null || true
+
+echo "ML Zoomcamp environment ready."
+echo "  • python:             $(command -v python)"
+echo "  • conda:              $(conda --version)"
+echo "  • JUPYTER_CONFIG_DIR: $JUPYTER_CONFIG_DIR"
+echo "  • project dir:        $MLZOOMCAMP_PROJECT_DIR"
+echo ""
+echo "Commands available in this shell:"
+echo "  • start-jupyter   → jupyter notebook  (https://0.0.0.0:8888/)"
+echo "  • start-mlflow    → mlflow ui on http://0.0.0.0:5000"
+echo "                     (backend ./mlruns, artifacts ./artifacts)"
+
+unset _ENV_SH_DIR
+EOF
+chmod +x "$ENV_FILE"
+echo "✅ Wrote $ENV_FILE"
+
 echo "=========================================================="
-echo "🎉 Installation & Verification Complete!"
-echo "1. Run 'source ~/.zshrc' (or close/re-open your terminal)."
-echo "2. Run 'conda activate ml-zoomcamp' to start your environment."
-echo "3. Start Jupyter by typing 'jupyter notebook'."
-echo "   It will run securely on https://0.0.0.0:8888/"
-echo "   (Note: Your browser will warn you about the self-signed certificate. This is normal, and you can safely proceed.)"
+echo "🎉 Installation Complete — no rc files or global Jupyter config modified."
+echo ""
+echo "To use the environment in any shell:"
+echo "    source $ENV_FILE"
+echo ""
+echo "Then use:"
+echo "    start-jupyter     # https://0.0.0.0:8888/"
+echo "    start-mlflow      # http://0.0.0.0:5000/"
+echo ""
+echo "Jupyter config lives in:"
+echo "    $PROJECT_JUPYTER_DIR"
+echo "(Your browser will warn about the self-signed cert — this is expected.)"
 echo "=========================================================="
