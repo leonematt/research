@@ -2,5 +2,12 @@
 mlflow.db
 mlruns
 data
+models
 output
 artifacts
+
+env.sh
+
+.jupyter
+
+run_id.txt
