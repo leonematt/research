@@ -6,8 +6,13 @@ models
 output
 artifacts
 
+Pipfile
+Pipfile.lock
+
 env.sh
 
 .jupyter
 
 run_id.txt
+
+*.parquet
