@@ -143,9 +143,15 @@ echo "✅ Wrote project-local Jupyter config to $PROJECT_JUPYTER_CONFIG"
 # Make sure the assignments dir exists so Jupyter doesn't complain on first launch
 mkdir -p "$SCRIPT_DIR/assignments"
 
+# Generate a fresh alphanumeric API key for this run
+ML_ZOOMCAMP_API_KEY="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 43)"
+
 # --- Emit env.sh ---
 echo "Generating $ENV_FILE ..."
-cat > "$ENV_FILE" <<'EOF'
+cat > "$ENV_FILE" <<EOF
+export ML_ZOOMCAMP_API_KEY="${ML_ZOOMCAMP_API_KEY}"
+EOF
+cat >> "$ENV_FILE" <<'EOF'
 # ML Zoomcamp environment loader.
 # Usage: source ./env.sh
 #
