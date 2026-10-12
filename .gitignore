@@ -5,6 +5,7 @@ data
 models
 output
 artifacts
+results
 
 Pipfile
 Pipfile.lock

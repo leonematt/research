@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""Stand-in for the `vllm` CLI, for testing the harness without a GPU.
+
+  vllm --version
+  vllm serve MODEL [flags]      OpenAI-ish server: /health /metrics /v1/completions (stream + plain)
+                                /reset_prefix_cache /start_profile /stop_profile; logs an engine
+                                config dump that reflects the flags, like the real one
+  vllm bench serve [flags]      drives the server with llmbench's own client, writes a result JSON
+
+The speed model reacts to flags (eager is slower, FP8 faster, prefix caching cuts TTFT on shared
+prefixes, ...) so comparisons have something to show. FAKE_VLLM_REJECT=<flag> makes `serve` fail
+on that flag; FAKE_VLLM_SLOW=<config arg> adds jitter so the anomaly walk has something to find.
+"""
+import json
+import os
+import random
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+VERSION = os.environ.get("FAKE_VLLM_VERSION", "0.31.0")
+
+
+def arg(args, name, default=None):
+    if name in args:
+        i = args.index(name)
+        return args[i + 1] if i + 1 < len(args) else default
+    return default
+
+
+def serve(args):
+    model = args[0]
+    reject = os.environ.get("FAKE_VLLM_REJECT")
+    if reject and reject in args:
+        print(f"vllm serve: error: unrecognized arguments: {reject}", flush=True)
+        sys.exit(2)
+    oom_above = os.environ.get("FAKE_VLLM_OOM_ABOVE")       # "0.75": spec configs OOM above this fraction
+    if oom_above and "--speculative-config" in args and float(arg(args, "--gpu-memory-utilization", 0.9)) > float(oom_above):
+        print("(EngineCore pid=1) INFO [kernel_warmup.py:291] Warming up FlashInfer attention.", flush=True)
+        print("(EngineCore pid=1) ERROR torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 742.00 MiB.",
+              flush=True)
+        sys.exit(1)
+    starve = os.environ.get("FAKE_VLLM_STARVE_BELOW")      # "0.70": spec configs have no KV room below this
+    if starve and "--speculative-config" in args and float(arg(args, "--gpu-memory-utilization", 0.9)) < float(starve):
+        print("(EngineCore pid=1) ERROR ValueError: No available memory for the cache blocks. Try increasing "
+              "`gpu_memory_utilization` when initializing the engine.", flush=True)
+        sys.exit(1)
+    port = int(arg(args, "--port", 8000))
+    cc = json.loads(arg(args, "--compilation-config", "{}"))
+    eager = "--enforce-eager" in args or cc.get("mode") == 0 and False
+    mode = "NONE" if ("--enforce-eager" in args or cc.get("mode") == 0) else "VLLM_COMPILE"
+    graphs = "NONE" if "--enforce-eager" in args else cc.get("cudagraph_mode", "FULL_AND_PIECEWISE")
+    apc = "--no-enable-prefix-caching" not in args
+    chunked = "--no-enable-chunked-prefill" not in args
+    async_s = "--no-async-scheduling" not in args
+    quant = arg(args, "--quantization") or ("fp8" if model.endswith("-FP8") else None)
+    kv = arg(args, "--kv-cache-dtype", "auto")
+    spec = arg(args, "--speculative-config")
+    tp = int(arg(args, "--tensor-parallel-size", 1))
+    pp = int(arg(args, "--pipeline-parallel-size", 1))
+    dp = int(arg(args, "--data-parallel-size", 1))
+    mnbt = int(arg(args, "--max-num-batched-tokens", 8192))
+    gpu_mem = float(arg(args, "--gpu-memory-utilization", 0.9))
+    backend = arg(args, "--attention-backend", "FLASH_ATTN")
+    custom_ops = cc.get("custom_ops", ["none"])
+    prof = json.loads(arg(args, "--profiler-config", "null") or "null")
+
+    # speed model: seconds per output token per request, and per prompt token for prefill
+    tpot = 0.0016
+    tpot *= 1.6 if mode == "NONE" and graphs == "NONE" else 1.25 if graphs == "NONE" else 1.08 if mode == "NONE" else 1.0
+    tpot *= 0.8 if quant else 1.0
+    tpot *= 0.95 if "fp8" in kv else 1.0
+    tpot *= 0.97 if async_s else 1.0
+    tpot *= 0.9 if backend == "FLASHINFER" else 1.1 if backend == "TRITON_ATTN" else 1.0
+    tpot /= (tp ** 0.6) * (dp if dp > 1 else 1) ** 0.3
+    prefill = 0.00002 * (1.3 if mode == "NONE" else 1.0)
+    kv_tokens = int(200000 * (gpu_mem - 0.3) * (2 if "fp8" in kv else 1))
+    jitter = 0.5 if os.environ.get("FAKE_VLLM_SLOW") and os.environ["FAKE_VLLM_SLOW"] in args else 0.03
+
+    print(f"INFO Initializing a V1 LLM engine (v{VERSION}) with config: model='{model}', speculative_config="
+          f"{'SpeculativeConfig(x)' if spec else 'None'}, tensor_parallel_size={tp}, pipeline_parallel_size={pp}, "
+          f"data_parallel_size={dp}, quantization={quant}, enforce_eager={'--enforce-eager' in args}, "
+          f"kv_cache_dtype={kv}, enable_prefix_caching={apc}, enable_chunked_prefill={chunked}, "
+          f"async_scheduling={async_s}, compilation_config={{'mode': <CompilationMode.{mode}: 3>, "
+          f"'custom_ops': {custom_ops!r}, 'cudagraph_mode': <CUDAGraphMode.{graphs}: 2>, "
+          f"'pass_config': {{'fuse_norm_quant': {cc.get('pass_config', {}).get('fuse_norm_quant', bool(quant))}}}}}",
+          flush=True)
+    print(f"INFO Using {backend} attention backend out of potential backends", flush=True)
+    if chunked:
+        print(f"INFO Chunked prefill is enabled with max_num_batched_tokens={mnbt}.", flush=True)
+    print("INFO Loading weights took 1.20 seconds", flush=True)
+    if mode != "NONE":
+        print("INFO Directly load AOT compilation from cache", flush=True)
+        print("INFO torch.compile takes 0.5 s in total", flush=True)
+    print(f"INFO GPU KV cache size: {kv_tokens:,} tokens", flush=True)
+
+    state = dict(active=0, prefix_queries=0, prefix_hits=0, drafts=0, draft_tok=0, acc_tok=0, preempt=0,
+                 cache=set(), profiling=False, prof_events=[])
+    lock = threading.Lock()
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body, ctype="application/json"):
+            b = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_GET(self):
+            if self.path == "/health":
+                return self._send(200, "")
+            if self.path == "/metrics":
+                with lock:
+                    s = state
+                    txt = (f"vllm:num_preemptions_total{{model_name=\"m\"}} {s['preempt']}\n"
+                           f"vllm:prefix_cache_queries_total{{model_name=\"m\"}} {s['prefix_queries']}\n"
+                           f"vllm:prefix_cache_hits_total{{model_name=\"m\"}} {s['prefix_hits']}\n"
+                           f"vllm:spec_decode_num_drafts_total {s['drafts']}\n"
+                           f"vllm:spec_decode_num_draft_tokens_total {s['draft_tok']}\n"
+                           f"vllm:spec_decode_num_accepted_tokens_total {s['acc_tok']}\n")
+                return self._send(200, txt, "text/plain")
+            self._send(404, "{}")
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+            if self.path == "/reset_prefix_cache":
+                with lock:
+                    state["cache"].clear()
+                return self._send(200, "{}")
+            if self.path == "/start_profile":
+                state["profiling"], state["prof_events"] = True, []
+                return self._send(200, "{}")
+            if self.path == "/stop_profile":
+                state["profiling"] = False
+                if prof:
+                    d = Path(prof["torch_profiler_dir"])
+                    d.mkdir(parents=True, exist_ok=True)
+                    (d / "rank0.123.pt.trace.json").write_text(json.dumps({"traceEvents": state["prof_events"]}))
+                return self._send(200, "{}")
+            if self.path != "/v1/completions":
+                return self._send(404, "{}")
+            prompt = body.get("prompt", "")
+            toks = prompt if isinstance(prompt, list) else list(range(max(1, len(str(prompt)) // 4)))
+            n_out = int(body.get("max_tokens", 16))
+            # prefix caching: blocks of 16 tokens seen before are free
+            with lock:
+                state["active"] += 1
+                active = state["active"]
+                blocks = [tuple(toks[: (i + 1) * 16]) for i in range(len(toks) // 16)]
+                hits = sum(1 for b in blocks if b in state["cache"]) if apc else 0
+                state["prefix_queries"] += len(toks)
+                state["prefix_hits"] += hits * 16
+                if apc:
+                    state["cache"].update(blocks)
+            ttft = prefill * (len(toks) - hits * 16) * (1 + active / 32) + 0.002
+            per_tok = tpot * (1 + active / 64) * (1 + random.uniform(-jitter, jitter))
+            accept = 0.0
+            if spec and not isinstance(prompt, list) or (spec and isinstance(prompt, list) and len(toks) < 200):
+                accept = 0.6          # text prompts: drafts get accepted
+            if accept:
+                per_tok *= 0.65 + 0.35 * min(1, active / 16)    # speculative decoding helps at low concurrency
+                with lock:
+                    state["drafts"] += n_out // 4
+                    state["draft_tok"] += n_out
+                    state["acc_tok"] += int(n_out * accept)
+            t0 = time.perf_counter()
+            try:
+                if not body.get("stream"):
+                    time.sleep(ttft + per_tok * n_out)
+                    return self._send(200, json.dumps({"choices": [{"text": "x" * n_out}],
+                                                       "usage": {"prompt_tokens": len(toks), "completion_tokens": n_out}}))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+
+                def chunk(obj):
+                    data = ("data: " + (obj if isinstance(obj, str) else json.dumps(obj)) + "\n\n").encode()
+                    self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+                    self.wfile.flush()
+
+                time.sleep(ttft)
+                for i in range(n_out):
+                    if i:
+                        time.sleep(per_tok)
+                    chunk({"choices": [{"text": "x", "index": 0}]})
+                chunk({"choices": [], "usage": {"prompt_tokens": len(toks), "completion_tokens": n_out}})
+                chunk("[DONE]")
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            finally:
+                with lock:
+                    state["active"] -= 1
+                    if state["profiling"]:
+                        ts = t0 * 1e6
+                        dur = (time.perf_counter() - t0) * 1e6
+                        state["prof_events"] += [
+                            {"ph": "X", "cat": "kernel", "name": "sm90_xmma_gemm_bf16", "ts": ts, "dur": dur * 0.5},
+                            {"ph": "X", "cat": "kernel", "name": "flash_fwd_splitkv_kernel", "ts": ts + dur * 0.5,
+                             "dur": dur * 0.25},
+                            {"ph": "X", "cat": "kernel", "name": "rms_norm_kernel", "ts": ts + dur * 0.75, "dur": dur * 0.05},
+                            {"ph": "X", "cat": "kernel", "name": "triton_poi_fused_mul_silu_0", "ts": ts + dur * 0.8,
+                             "dur": dur * 0.08 if mode != "NONE" else dur * 0.15}]
+
+    srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    srv.daemon_threads = True
+    print(f"INFO Starting vLLM API server on http://127.0.0.1:{port}", flush=True)
+    srv.serve_forever()
+
+
+def bench(args):
+    sys.path.insert(0, os.environ["LLMBENCH_ROOT"])
+    from llmbench import client
+    from llmbench.metrics import parse_slo, summarize
+    from llmbench.workloads import PromptSet
+
+    port = int(arg(args, "--port"))
+    model = arg(args, "--model")
+    n = int(arg(args, "--num-prompts"))
+    conc = arg(args, "--max-concurrency")
+    rate = arg(args, "--request-rate", "inf")
+    in_len = int(arg(args, "--random-input-len", 128))
+    out_len = int(arg(args, "--random-output-len", 32))
+    pfx = int(arg(args, "--random-prefix-len", 0))
+    seed = int(arg(args, "--seed", 0))
+    rng = random.Random(seed)
+    prefix = [rng.randint(100, 30000) for _ in range(pfx)]
+    ps = PromptSet(ids=[prefix + [rng.randint(100, 30000) for _ in range(in_len)] for _ in range(n)],
+                   out_lens=[out_len] * n)
+    c = int(conc) if conc else (n if rate == "inf" else max(1, min(n, int(float(rate) * 2) + 1)))
+    res = client.run("127.0.0.1", port, model, ps, c)
+    goodput = None
+    if "--goodput" in args:
+        i = args.index("--goodput")
+        slo = parse_slo(" ".join(x for x in args[i + 1:i + 3] if ":" in x))
+    else:
+        slo = None
+    row = summarize(res["reqs"], res["duration"], slo)
+    row["completed"] = len(res["reqs"])
+    row["num_prompts"] = n
+    if goodput:
+        row["request_goodput"] = goodput
+    out = Path(arg(args, "--result-dir", ".")) / arg(args, "--result-filename", "result.json")
+    out.write_text(json.dumps(row))
+    print(f"Successful requests: {len(res['reqs'])}")
+
+
+def main():
+    a = sys.argv[1:]
+    if a and a[0] in ("--version", "-v"):
+        print(VERSION)
+    elif a[:1] == ["serve"]:
+        serve(a[1:])
+    elif a[:2] == ["bench", "serve"]:
+        bench(a[2:])
+    else:
+        print("usage: vllm serve|bench serve|--version", file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
