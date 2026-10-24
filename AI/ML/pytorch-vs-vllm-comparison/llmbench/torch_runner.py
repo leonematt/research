@@ -55,6 +55,8 @@ def apply_skips(cfgs: list[Config], a: argparse.Namespace, hw: Optional[Hardware
             pass
         elif pt.get("quant") and not fake and not _has("torchao"):
             skip = "torchao not installed (./run.sh setup)"
+        elif pt.get("quant") == "int4" and not fake and not _has("mslk"):
+            skip = "torchao int4 needs the mslk package (try: uv pip install mslk)"
         elif pt.get("kernels") and not fake and not _has("kernels"):
             skip = "the `kernels` package isn't installed (uv pip install kernels)"
         elif pt.get("assisted") and not draft:

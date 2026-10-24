@@ -26,7 +26,7 @@ from pathlib import Path
 
 from .metrics import parse_slo, summarize
 from .results import write_row
-from .sampling import Policy, cv, good, need_more
+from .sampling import Policy, cv, good, is_quiet, need_more
 from .util import write_json
 from .workloads import PromptSet, Workload, make_prompts, regular_vocab
 
@@ -406,6 +406,7 @@ def main() -> None:
             return 2 * tc.num_hidden_layers * kvh * hd * dtype.itemsize * B * L / 2**30
 
     policy = Policy(a.min_repeats, a.max_repeats, a.target_cv)
+    quiet_cvs: list[float] = []
     compiled_any = False
     compiles_total, compile_s_total = 0, 0.0
     for w in wls:
@@ -420,6 +421,8 @@ def main() -> None:
             have[int(r.get("repeat") or 0)] = r
         if targets is None:
             pol, attempted0 = policy, len(have)
+            if is_quiet(quiet_cvs, policy):
+                pol = Policy(1, policy.max_repeats, policy.target_cv)
         else:
             base_good = sum(1 for r in have.values() if good(r))
             extra = max(1, int(targets.get(w.name, 1)))
@@ -512,6 +515,10 @@ def main() -> None:
                 print(f"PT| {w.label:<36} r{rep} out={thr:8.1f} tok/s  ttft50={row['median_ttft_ms']:7.1f}ms  "
                       f"tpot50={row['median_tpot_ms']:6.2f}ms" + (f"  cv={spread:.1%}" if spread == spread else "")
                       + f"  ({row['bench_wall_s']:.0f}s){rc}", flush=True)
+
+        sw = cv([r.get("output_throughput") for r in have.values() if good(r)])
+        if sw == sw:
+            quiet_cvs.append(sw)
 
     facts["compiled"] = compiled_any if not fake else facts.get("compiled")
     if clog is not None and clog.ok:

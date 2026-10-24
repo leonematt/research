@@ -81,7 +81,10 @@ def profile(a, hw: Hardware) -> CardProfile:
 
 
 def headroom_gib(cfg, card: CardProfile) -> tuple[float, str]:
-    """Extra memory a vLLM config needs outside what the profiler accounts for."""
+    """Memory a vLLM config allocates AFTER its profiling pass, i.e. outside --gpu-memory-utilization.
+    Draft / EAGLE weights are NOT in here: vLLM loads them before profiling and counts them in the
+    budget. What escapes is the draft's attention warmup (FlashInfer workspace) and its CUDA graphs,
+    ~0.75-1 GiB, which on a 16 GB card was enough to push the process past the device limit."""
     args = cfg.args
     if "--speculative-config" not in args:
         return 0.0, ""
@@ -89,17 +92,10 @@ def headroom_gib(cfg, card: CardProfile) -> tuple[float, str]:
         spec = json.loads(args[args.index("--speculative-config") + 1])
     except (ValueError, IndexError):
         spec = {}
-    method = spec.get("method", "draft_model" if spec.get("model") else "")
-    warm = 1.0 if card.tight else 0.5          # draft attention warmup + its CUDA graphs
-    if method == "ngram":
+    if spec.get("method") == "ngram":
         return 0.25, "n-gram drafting buffers"
-    draft = spec.get("model")
-    w = weights_gib(draft) if draft else None
-    if method == "eagle3" or method == "eagle":
-        w = w if w is not None else 0.8
-        return w + warm, f"EAGLE head ~{w:.1f} GiB + {warm:.1f} GiB warmup"
-    w = w if w is not None else 1.5
-    return w + warm, f"draft model ~{w:.1f} GiB + {warm:.1f} GiB warmup"
+    warm = 1.0 if card.tight else 0.5
+    return warm, f"draft attention warmup + CUDA graphs ~{warm:.1f} GiB, allocated after vLLM's profiling"
 
 
 def apply_headroom(cfgs: list, a, card: CardProfile, quiet: bool = False) -> None:
@@ -160,16 +156,28 @@ def fit_workloads(wls: list, card: CardProfile, oversub: float, quiet: bool = Fa
     return kept, dropped
 
 
+CACHE_STARVED = "No available memory for the cache blocks"
+
+
+def oom_kind(log_text: str) -> Optional[str]:
+    """'starved': the budget left nothing for KV (raise the fraction); 'device': the process outgrew
+    the GPU (lower it); None: not a memory failure."""
+    if CACHE_STARVED in log_text:
+        return "starved"
+    return "device" if any(m in log_text for m in OOM_MARKERS if m != CACHE_STARVED) else None
+
+
 def is_oom(log_text: str) -> bool:
     return any(m in log_text for m in OOM_MARKERS)
 
 
-def lower_gpu_mem(cfg, base: float) -> Optional[float]:
-    """Next memory fraction for an OOM retry, or None when out of room / retries."""
+def lower_gpu_mem(cfg, base: float, raise_: bool = False) -> Optional[float]:
+    """Next memory fraction for a memory-failure retry (lower, or raise back toward the run's base
+    fraction when the KV cache was starved), or None when there's no room left to move."""
     args = cfg.args
     cur = float(args[args.index("--gpu-memory-utilization") + 1]) if "--gpu-memory-utilization" in args else base
-    new = round(cur - OOM_STEP, 2)
-    if new < 0.3:
+    new = round(min(base, cur + OOM_STEP) if raise_ else cur - OOM_STEP, 2)
+    if new < 0.3 or new == cur:
         return None
     if "--gpu-memory-utilization" in args:
         i = args.index("--gpu-memory-utilization")

@@ -119,7 +119,14 @@ def unit() -> None:
     plain = Config("vllm_default", "vllm", "default", [], "")
     tailor.apply_headroom([spec, plain], Small, card, quiet=True)
     frac = float(spec.args[spec.args.index("--gpu-memory-utilization") + 1])
-    check(frac < 0.70 and "--gpu-memory-utilization" not in plain.args, "draft-model config gets a memory reservation, default doesn't")
+    check(0.70 <= frac <= 0.73 and "--gpu-memory-utilization" not in plain.args,
+          "draft config reserves only the post-profiling warmup (~1 GiB), default untouched")
+    check(tailor.oom_kind("ValueError: No available memory for the cache blocks") == "starved"
+          and tailor.oom_kind("torch.OutOfMemoryError: CUDA out of memory") == "device", "memory failures classified")
+    sc = Config("x", "vllm", "component", [], "", args=["--gpu-memory-utilization", "0.62"])
+    check(tailor.lower_gpu_mem(sc, 0.78, raise_=True) == 0.66, "cache-starved retry raises the fraction")
+    check(not sampling.is_quiet([0.0], sampling.Policy(2, 4, 0.05)) and sampling.is_quiet([0.0, 0.01], sampling.Policy(2, 4, 0.05))
+          and not sampling.is_quiet([0.0, 0.04], sampling.Policy(2, 4, 0.05)), "quiet config detected after 2 calm workloads")
     kept, dropped = tailor.fit_workloads(build_workloads("standard", 8192, quiet=True), card, 4.0, quiet=True)
     check(any(w.concurrency == 128 for w in dropped) and any(w.kind == "reference" for w in kept),
           "shapes far beyond KV capacity dropped, reference kept")
@@ -162,13 +169,13 @@ def e2e() -> None:
                LLMBENCH_ROOT=str(ROOT), LLMBENCH_FAKE_TORCH="1",
                LLMBENCH_FAKE_HW='{"name": "NVIDIA H100 80GB HBM3", "gib": 80, "n": 1, "cc": 9.0, "no_smi": true}',
                FAKE_VLLM_SLOW="--block-size", FAKE_VLLM_REJECT="--no-enable-chunked-prefill",
-               LLMBENCH_FAKE_FAIL="pt_cb:mixed", PYTHONPATH=str(ROOT))
+               LLMBENCH_FAKE_FAIL="pt_cb:mixed", PYTHONPATH=str(ROOT), FAKE_VLLM_STARVE_BELOW="0.90")
     env.pop("LLMBENCH_VLLM_VERSION", None)
     cmd = [sys.executable, "-m", "llmbench", "run", "--preset", "check", "--min-repeats", "2", "--max-repeats", "4",
            "--retry-rounds", "1", "--profile", "--out", str(out), "--port", "18099", "--settle-s", "0",
            "--startup-timeout", "30", "--no-plots", "--configs",
            "vllm_default,vllm_minimal,vllm_lad_prefix,vllm_optimized,block_size_32,no_prefix_cache,enforce_eager,"
-           "vllm_static_waves,spec_ngram,pt_eager,pt_static,pt_cb,pt_compile,pt_cb_noprefix"]
+           "vllm_static_waves,spec_ngram,spec_draft,pt_eager,pt_static,pt_cb,pt_compile,pt_cb_noprefix"]
     r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, timeout=900)
     log = r.stdout + r.stderr
     (out / "e2e.log").write_text(log)
@@ -183,6 +190,8 @@ def e2e() -> None:
               "kernel_breakdown.csv", "anomalies.csv", "report.md"):
         check((rd / f).exists() and (rd / f).stat().st_size > 50, f"{f} written")
     check("[rebuild] vllm_minimal" in log, "composite rebuilt after a rejected flag")
+    sd = s_ = json.loads((rd / "summary.json").read_text())["server_facts"].get("spec_draft", {})
+    check(sd.get("status") == "ok" and sd.get("oom_retries"), "cache-starved spec config recovered by raising its fraction")
     s = json.loads((rd / "summary.json").read_text())
     vm = next(c for c in s["configs"] if c["name"] == "vllm_minimal")
     check("mnbt_max_model_len" in vm["components"] and "rebuilt" in vm["note"], "vllm_minimal uses the fallback component")
@@ -191,8 +200,8 @@ def e2e() -> None:
     check(("pt_cb", "partial") in got, "failed repeat flagged as partial")
     check(an[(an["config"] == "pt_cb")]["outcome"].eq("resolved").all(), "pt_cb retry resolved it")
     res = pd.read_csv(rd / "results.csv")
-    bs = res[(res["config"] == "block_size_32") & (res["workload"] == "reference")]
-    check(len(bs) == 1 and bs["n_repeats"].iloc[0] > 2, "noisy config got extra adaptive repeats")
+    bs = res[res["config"] == "block_size_32"]
+    check(len(bs) and bs["n_repeats"].max() > 2, "noisy config got extra adaptive repeats")
     check((rd / "raw" / "retired").exists(), "failed repeats retired, not deleted")
     long = pd.read_csv(rd / "results_long.csv")
     check({"engine", "tier", "categories", "metric", "value", "unit"} <= set(long.columns), "long CSV has labels")

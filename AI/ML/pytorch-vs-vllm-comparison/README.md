@@ -194,6 +194,9 @@ sns.lineplot(d, x="concurrency", y="value", hue="config", style="input_len")
 ./run.sh quick --categories speculative_decoding,quantization     # anchors are always kept
 ./run.sh standard --engines vllm --profile                         # + kernel_breakdown.csv
 ./run.sh custom --run-id <id> --resume                             # finish an interrupted run
+# continue a suite after updating the code, without redoing the ~1 h check, and bring back a
+# config the check failed for a reason that has since been fixed:
+./run.sh suite --reuse-check --include spec_draft --run-id <standard run id>
 ```
 
 Overrides: `FAMILY=gemma4`, `MODEL=<id or path>`, `TP=2`, `GPU_MEM=0.8`,

@@ -47,7 +47,8 @@ LOG_FACTS = {
     "cfg_kv_cache_dtype": r"kv_cache_dtype=(\w+)",
     "cfg_prefix_caching": r"enable_prefix_caching=(\w+)",
     "cfg_chunked_prefill": r"(?:enable_chunked_prefill|chunked_prefill_enabled)=(\w+)",
-    "cfg_async_scheduling": r"async_scheduling=(\w+)",
+    # engine config dump ("async_scheduling=True"), or the scheduler's own startup line
+    "cfg_async_scheduling": r"async_scheduling['\"]?\s*[=:]\s*['\"]?(\w+)|(?:Async|Asynchronous) scheduling (?:is )?(enabled|disabled)",
     "cfg_quantization": r"\bquantization=(\w+)",
     "cfg_speculative": r"speculative_config=(\w+)",
     "cfg_tp": r"tensor_parallel_size=(\d+)",
@@ -69,7 +70,9 @@ def parse_server_log(path: Path) -> dict:
         m = re.search(pat, txt, flags=re.IGNORECASE)
         if not m:
             continue
-        val = m.group(1).replace(",", "") if key != "cfg_custom_ops" else m.group(1)
+        raw = next(g for g in m.groups() if g is not None)
+        raw = {"enabled": "True", "disabled": "False"}.get(raw.lower(), raw)
+        val = raw.replace(",", "") if key != "cfg_custom_ops" else raw
         if key == "attention_backend" or key.startswith("cfg_"):
             facts[key] = val.strip().strip("'\"") if key != "cfg_custom_ops" else val.replace("'", "").strip()
         else:
@@ -695,12 +698,15 @@ def run_vllm(a: argparse.Namespace, run_dir: Path, cfgs: list[Config], wls: list
             print(explain_failure(log_path))
             server.stop()
             log_txt = log_path.read_text(errors="replace") if log_path.exists() else ""
-            if tailor.is_oom(log_txt) and oom_tries.get(cfg.name, 0) < tailor.OOM_RETRIES:
+            kind = tailor.oom_kind(log_txt)
+            if kind and oom_tries.get(cfg.name, 0) < tailor.OOM_RETRIES:
                 oom_tries[cfg.name] = oom_tries.get(cfg.name, 0) + 1
-                new_mem = tailor.lower_gpu_mem(cfg, a.gpu_mem)
+                new_mem = tailor.lower_gpu_mem(cfg, a.gpu_mem, raise_=kind == "starved")
                 if new_mem is not None:
-                    cfg.note = (cfg.note + "; " if cfg.note else "") + f"OOM at startup: memory fraction lowered to {new_mem}"
-                    print(f"  [tailor] out of memory at startup: retrying {cfg.name} with memory fraction {new_mem} "
+                    what = ("no memory left for the KV cache: memory fraction raised" if kind == "starved"
+                            else "out of memory at startup: memory fraction lowered")
+                    cfg.note = (cfg.note + "; " if cfg.note else "") + f"{what} to {new_mem}"
+                    print(f"  [tailor] {what} to {new_mem}; retrying {cfg.name} "
                           f"(attempt {oom_tries[cfg.name]}/{tailor.OOM_RETRIES})")
                     log_path.replace(log_path.with_name(f"{cfg.name}.oom{oom_tries[cfg.name]}.log"))
                     summary["configs"] = [cfg.to_dict() if c["name"] == cfg.name else c for c in summary["configs"]]
@@ -730,6 +736,7 @@ def run_vllm(a: argparse.Namespace, run_dir: Path, cfgs: list[Config], wls: list
             # closed-loop workloads first: the default's capacity sizes the rate workloads
             ordered = [w for w in cwls if w.kind != "rate"] + [w for w in cwls if w.kind == "rate"]
             cfg_rows: list[dict] = []
+            quiet_cvs: list[float] = []          # run-to-run spread seen on this config so far
             for w in ordered:
                 if w.kind == "rate" and not w.request_rate:
                     if cfg.name == "vllm_default":
@@ -751,6 +758,9 @@ def run_vllm(a: argparse.Namespace, run_dir: Path, cfgs: list[Config], wls: list
                 p = sampling.Policy(base_good + max(1, force) if targets is not None else policy.min_repeats,
                                     base_good + max(1, force) + 1 if targets is not None else policy.max_repeats,
                                     policy.target_cv)
+                if targets is None and sampling.is_quiet(quiet_cvs, policy):
+                    p = sampling.Policy(1, policy.max_repeats, policy.target_cv)
+                    eta.add(-(policy.min_repeats - 1))
                 attempted = 0
                 while sampling.need_more(list(have.values()), len(have) if targets is None else base_good + attempted, p):
                     rep = max(have, default=-1) + 1
@@ -773,6 +783,14 @@ def run_vllm(a: argparse.Namespace, run_dir: Path, cfgs: list[Config], wls: list
                           f"pre={row.get('preemptions', float('nan')):.0f}"
                           + (f"  cv={spread:.1%}" if spread == spread else "")
                           + f"  ({time.time() - t0:.0f}s, {eta})")
+                spread_w = sampling.cv([r.get("output_throughput") for r in have.values() if sampling.good(r)])
+                if spread_w == spread_w:
+                    was = sampling.is_quiet(quiet_cvs, policy)
+                    quiet_cvs.append(spread_w)
+                    if not was and sampling.is_quiet(quiet_cvs, policy) and policy.min_repeats > 1:
+                        print(f"  [sampling] {cfg.name} is quiet (run-to-run spread "
+                              f"{max(quiet_cvs):.1%} <= {policy.target_cv / 2:.1%}): 1 repeat for its remaining "
+                              "workloads; the anomaly walk still re-checks outliers")
                 aggregate(run_dir)
             if prof_dir is not None:
                 try:

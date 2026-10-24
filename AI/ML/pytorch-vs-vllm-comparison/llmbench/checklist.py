@@ -58,6 +58,8 @@ def write_checklist(run_dir: Path) -> dict:
             f.update(parse_server_log(log))
     df = pd.read_csv(run_dir / "results_all.csv") if (run_dir / "results_all.csv").exists() else None
     rows, passed, failed = [], {"vllm": [], "pytorch": []}, []
+    # facts this engine version never prints (e.g. async_scheduling in vLLM 0.32's config dump)
+    reported = {k for f in facts_all.values() if isinstance(f, dict) for k, v in f.items() if v is not None}
     cfgs = {c["name"]: c for c in summary["configs"]}
     for name in list(cfgs) + [n for n in summary.get("skipped", {}) if n not in cfgs]:
         c = cfgs.get(name, {})
@@ -86,7 +88,7 @@ def write_checklist(run_dir: Path) -> dict:
             verify = c.get("verify") or []
             bad = [(k, want, f.get(k), what) for k, op, want, what in verify
                    if f.get(k) is not None and not _check(op, want, f.get(k))]
-            unread = [(k, what) for k, op, want, what in verify if f.get(k) is None]
+            unread = [(k, what) for k, op, want, what in verify if f.get(k) is None and k in reported]
             dup = c.get("same_as")
             other = facts_all.get(dup[0], {}) if dup else {}
             if f.get("cb_dropped"):

@@ -93,7 +93,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--max-batches", type=int, help="PyTorch static batching: measured batches per run (default 4)")
     g.add_argument("--warmup-prompts", type=int)
     g.add_argument("--rate-base", type=float, help="req/s that rate workloads are fractions of (default: measured)")
-    g.add_argument("--kv-oversub", type=float, default=4.0,
+    g.add_argument("--kv-oversub", type=float, default=2.0,
                    help="drop shapes needing more than this x the estimated KV capacity in flight (0 = keep all)")
     g = p.add_argument_group("output / runtime")
     g.add_argument("--out", default="results")
@@ -118,6 +118,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--kv-tokens", type=int, default=0, help=argparse.SUPPRESS)
     g.add_argument("--device", default="cuda", help=argparse.SUPPRESS)     # cpu: plumbing tests
     g.add_argument("--fresh-check", action="store_true", help="suite: always redo the check")
+    g.add_argument("--reuse-check", action="store_true",
+                   help="suite: reuse the newest check even if it was made by older harness code")
+    g.add_argument("--include", help="suite: configs to run even though they failed the check (cause fixed since)")
     a = p.parse_args(argv)
     preset = PRESETS[a.preset or ("check" if a.command == "check" else "quick")]
     for k, v in preset.items():
@@ -330,6 +333,8 @@ def execute(a: argparse.Namespace, exclude: Optional[set[str]] = None, tag: Opti
         summary = json.loads((_run_dir(a) / "summary.json").read_text())
         apply_summary(a, summary)
         a.resume = True
+        summary.update(min_repeats=a.min_repeats, max_repeats=a.max_repeats, target_cv=a.target_cv,
+                       harness=harness_fingerprint())
     hw = a.hw if existing else resolve(a)
     run_id = a.run_id or f"{hw.slug}_{tag or a.run_tag or a.preset or 'run'}_{dt.datetime.now():%Y%m%d_%H%M%S}"
     a.run_id = run_id
@@ -453,6 +458,10 @@ def cmd_suite(a: argparse.Namespace) -> None:
         if cp.get("harness") == harness_fingerprint() and age_h < 6 and "vllm_default" in cp.get("vllm", []):
             fresh = chk
             print(f"=== suite 1/2: reusing the check from {chk} (same harness, {age_h:.1f} h old; --fresh-check redoes it)")
+        elif a.reuse_check and "vllm_default" in cp.get("vllm", []):
+            fresh = chk
+            print(f"=== suite 1/2: reusing the check from {chk} (--reuse-check: made by older harness code, "
+                  f"{age_h:.1f} h old)")
     if fresh is None:
         print("=== suite 1/2: functional check (every config, tiny grid)")
         ca = parse_args(["check"] + _passthrough(a))
@@ -468,12 +477,19 @@ def cmd_suite(a: argparse.Namespace) -> None:
             setattr(a, k, s[k])
     composites = {c["name"] for c in s["configs"] if c.get("components") or c.get("tier") in ("ladder", "optimized", "baseline")}
     keep = set(cp.get("vllm", [])) | set(cp.get("pytorch", [])) | composites
+    failed = set(cp.get("failed_components", []))
+    include = {x for x in (a.include or "").split(",") if x}
+    if include:                       # failed the check, but the cause has been fixed since
+        keep |= include
+        failed -= include
+        print(f"=== suite: --include brings back {', '.join(sorted(include))} despite the check")
     if a.configs:
         keep &= set(a.configs.split(","))
     a.configs = ",".join(sorted(keep))
-    print(f"=== suite 2/2: {a.preset or 'quick'} run with {len(keep)} configs that passed "
-          f"(composites rebuilt without: {', '.join(cp.get('failed_components', [])) or 'nothing'})")
-    run_dir = execute(a, exclude=set(cp.get("failed_components", [])))
+    print(f"=== suite 2/2: {a.preset or 'quick'} run with {len(keep)} configs"
+          + (f", continuing {a.run_id}" if a.run_id else "")
+          + f" (composites rebuilt without: {', '.join(sorted(failed)) or 'nothing'})")
+    run_dir = execute(a, exclude=failed)
     print(f"=== suite done: {run_dir / 'report.md'}   (checklist: {fresh / 'check.md'})")
 
 

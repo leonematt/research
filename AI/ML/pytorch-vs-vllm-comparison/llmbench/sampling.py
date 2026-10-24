@@ -53,6 +53,16 @@ def need_more(rows: list[dict], attempted: int, p: Policy, force_extra: int = 0)
     return c == c and c > p.target_cv
 
 
+QUIET_PROBES = 2   # workloads with >= 2 repeats needed before a config counts as quiet
+
+
+def is_quiet(cvs: list[float], p: Policy) -> bool:
+    """A config whose first QUIET_PROBES measured workloads all agreed to within half the target
+    spread gets 1 repeat for the rest: a second repeat would only re-measure the same number.
+    (On a stable box this halves the run; noisy configs keep the full adaptive treatment.)"""
+    return len(cvs) >= QUIET_PROBES and all(c <= p.target_cv / 2 for c in cvs[:QUIET_PROBES])
+
+
 class ETA:
     """Remaining-time estimate from the average wall time of the runs done so far."""
 

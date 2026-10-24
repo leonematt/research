@@ -42,6 +42,11 @@ def serve(args):
         print("(EngineCore pid=1) ERROR torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 742.00 MiB.",
               flush=True)
         sys.exit(1)
+    starve = os.environ.get("FAKE_VLLM_STARVE_BELOW")      # "0.70": spec configs have no KV room below this
+    if starve and "--speculative-config" in args and float(arg(args, "--gpu-memory-utilization", 0.9)) < float(starve):
+        print("(EngineCore pid=1) ERROR ValueError: No available memory for the cache blocks. Try increasing "
+              "`gpu_memory_utilization` when initializing the engine.", flush=True)
+        sys.exit(1)
     port = int(arg(args, "--port", 8000))
     cc = json.loads(arg(args, "--compilation-config", "{}"))
     eager = "--enforce-eager" in args or cc.get("mode") == 0 and False
