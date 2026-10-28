@@ -61,6 +61,8 @@ def detect(run_dir: Path, noisy_cv: float = 0.10, dip: float = 0.25) -> list[dic
         r = r.to_dict()
         status = r.get("status")
         err = str(r.get("bench_error") or "")
+        if status == "skipped":
+            continue                  # past this config's limit (sweep.py): expected, not an anomaly
         if status == "oom":
             add(r, "oom", err[:120], action="report", extra=0)
             continue

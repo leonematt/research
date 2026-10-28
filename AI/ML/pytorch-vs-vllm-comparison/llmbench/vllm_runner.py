@@ -18,12 +18,12 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from . import client, profiling, sampling, tailor
+from . import client, profiling, sampling, sweep, tailor
 from .configs import Config, select_workloads
 from .hardware import nvcc_env, vllm_version, wait_gpu_free, wait_gpu_settle, gpu_mem_state
 from .metrics import parse_slo, summarize
 from .results import aggregate, base_row, write_row
-from .util import drop_page_cache, http_get, http_post_json, meminfo_gib, write_json
+from .util import drop_page_cache, http_get, http_post_json, meminfo_gib, read_row, write_json
 from .workloads import NATIVE_KINDS, Workload, make_prompts, regular_vocab, resolve_rates
 
 # ----------------------------------------------------------------------------
@@ -553,7 +553,9 @@ def existing_reps(raw_dir: Path, cfg: str, wl: str) -> dict[int, dict]:
     out = {}
     for f in raw_dir.glob(f"{cfg}__{wl}__r*.row.json"):
         try:
-            r = json.loads(f.read_text())
+            r = read_row(f)
+            if r is None:
+                continue
             out[int(r.get("repeat") or 0)] = r
         except Exception:  # noqa: BLE001
             pass
@@ -611,6 +613,7 @@ def run_vllm(a: argparse.Namespace, run_dir: Path, cfgs: list[Config], wls: list
     ref_wl = next(w for w in wls if w.kind == "reference")
     prompts_cache = PromptCache(a.model)
     policy = sampling.Policy(a.min_repeats, a.max_repeats, a.target_cv)
+    wls_by_name = {w.name: w for w in wls}
     if summary.get("rate_base_rps"):
         resolve_rates(wls, summary["rate_base_rps"])
     plan = []
@@ -651,11 +654,27 @@ def run_vllm(a: argparse.Namespace, run_dir: Path, cfgs: list[Config], wls: list
                 print(f"    {w.label:<36} n={w.num_prompts:<4} {how if len(how) < 70 else how[:67] + '...'}")
             continue
 
-        def satisfied(w: Workload) -> bool:
-            have = list(existing_reps(raw_dir, cfg.name, w.name).values())
-            return not sampling.need_more(have, len(have), policy)
+        def config_done() -> bool:
+            """Every workload has enough repeats under the same rules the sweep loop applies,
+            including the quiet downshift (1 repeat once the first two workloads agreed)."""
+            cvs: list[float] = []
+            rows_now = sweep.load_rows(raw_dir, cfg.name, cwls)
+            for w in cwls:
+                if w.kind == "rate" and not w.request_rate:
+                    continue
+                have = list(existing_reps(raw_dir, cfg.name, w.name).values())
+                if any(sweep.is_skip_row(r) for r in have) or sweep.skip_reason(w, rows_now, wls_by_name):
+                    continue
+                p = sampling.Policy(1, policy.max_repeats, policy.target_cv) if sampling.is_quiet(cvs, policy) \
+                    else policy
+                if sampling.need_more(have, len(have), p):
+                    return False
+                c = sampling.cv([r.get("output_throughput") for r in have if sampling.good(r)])
+                if c == c:
+                    cvs.append(c)
+            return True
 
-        if targets is None and a.resume and all(satisfied(w) for w in cwls if w.kind != "rate" or w.request_rate):
+        if targets is None and a.resume and config_done():
             print("  all results present, reusing (no server start)")
             continue
         if targets is not None:
@@ -701,10 +720,16 @@ def run_vllm(a: argparse.Namespace, run_dir: Path, cfgs: list[Config], wls: list
             kind = tailor.oom_kind(log_txt)
             if kind and oom_tries.get(cfg.name, 0) < tailor.OOM_RETRIES:
                 oom_tries[cfg.name] = oom_tries.get(cfg.name, 0) + 1
-                new_mem = tailor.lower_gpu_mem(cfg, a.gpu_mem, raise_=kind == "starved")
-                if new_mem is not None:
+                new_mem, what = None, ""
+                if kind == "starved":      # shrinking the context costs nothing measured; try it first
+                    n = tailor.shrink_context(cfg, a.max_model_len, tailor.context_needed(cwls))
+                    if n is not None:
+                        new_mem, what = n, "KV pool too small for the context: max_model_len lowered"
+                if new_mem is None:
+                    new_mem = tailor.lower_gpu_mem(cfg, a.gpu_mem, raise_=kind == "starved")
                     what = ("no memory left for the KV cache: memory fraction raised" if kind == "starved"
                             else "out of memory at startup: memory fraction lowered")
+                if new_mem is not None:
                     cfg.note = (cfg.note + "; " if cfg.note else "") + f"{what} to {new_mem}"
                     print(f"  [tailor] {what} to {new_mem}; retrying {cfg.name} "
                           f"(attempt {oom_tries[cfg.name]}/{tailor.OOM_RETRIES})")
@@ -753,6 +778,15 @@ def run_vllm(a: argparse.Namespace, run_dir: Path, cfgs: list[Config], wls: list
                 have = existing_reps(raw_dir, cfg.name, w.name)
                 if targets is None and not a.resume:
                     have = {}
+                if any(sweep.is_skip_row(r) for r in have.values()):
+                    continue
+                reason = sweep.skip_reason(w, sweep.load_rows(raw_dir, cfg.name, cwls), wls_by_name)
+                if reason:
+                    srow = base_row(cfg, w, model, max(have, default=-1) + 1, cfg.gpus(a.tp))
+                    srow.update(bench_rc=0.0, skipped=1.0, bench_error=f"SKIP: {reason}", client="-")
+                    write_row(raw_dir, srow)
+                    print(f"  {w.label:<36} skipped: {reason}")
+                    continue
                 force = targets[cfg.name][w.name] if targets is not None else 0
                 base_good = sum(1 for r in have.values() if sampling.good(r)) if targets is not None else 0
                 p = sampling.Policy(base_good + max(1, force) if targets is not None else policy.min_repeats,

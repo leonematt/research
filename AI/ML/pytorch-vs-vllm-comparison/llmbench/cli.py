@@ -93,6 +93,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--max-batches", type=int, help="PyTorch static batching: measured batches per run (default 4)")
     g.add_argument("--warmup-prompts", type=int)
     g.add_argument("--rate-base", type=float, help="req/s that rate workloads are fractions of (default: measured)")
+    g.add_argument("--pre-drop", action="store_true",
+                   help="drop grid shapes that exceed the KV estimate up front, instead of stopping each "
+                        "sweep at runtime where a config runs out of memory / saturates")
     g.add_argument("--kv-oversub", type=float, default=2.0,
                    help="drop shapes needing more than this x the estimated KV capacity in flight (0 = keep all)")
     g = p.add_argument_group("output / runtime")
@@ -214,7 +217,10 @@ def build_plan(a: argparse.Namespace, exclude: Optional[set[str]] = None, quiet:
         for line in card.lines():
             print(f"[card] {line}")
     tailor.apply_headroom(vsel, a, card, quiet=quiet)
-    wls, dropped = tailor.fit_workloads(wls, card, a.kv_oversub, quiet=quiet)
+    wls, dropped = tailor.fit_workloads(wls, card, a.kv_oversub, quiet=quiet, drop_grid=a.pre_drop)
+    ref_t = tuple(GRIDS[a.grid]["reference"])
+    tailor.fit_context(vsel, lambda c: C.select_workloads(c, wls, ref_t, a.all_workloads), a.max_model_len,
+                       card, quiet=quiet)
     a.dropped_workloads = [w.label for w in dropped]
     return vsel, psel, ladders, wls, skipped
 

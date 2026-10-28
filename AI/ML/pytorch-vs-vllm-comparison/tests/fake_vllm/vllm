@@ -47,6 +47,13 @@ def serve(args):
         print("(EngineCore pid=1) ERROR ValueError: No available memory for the cache blocks. Try increasing "
               "`gpu_memory_utilization` when initializing the engine.", flush=True)
         sys.exit(1)
+    ctx_limit = os.environ.get("FAKE_VLLM_CTX_LIMIT")     # "2048": spec configs refuse a longer context
+    mml_arg = int([args[i + 1] for i, x in enumerate(args) if x == "--max-model-len"][-1]) if "--max-model-len" in args else 0
+    if ctx_limit and "--speculative-config" in args and mml_arg > int(ctx_limit):
+        print("(EngineCore pid=1) ERROR ValueError: To serve at least one request with the model's max seq len "
+              f"({mml_arg}), (2.0 GiB KV cache is needed, which is larger than the available KV cache memory (1.44 GiB).",
+              flush=True)
+        sys.exit(1)
     port = int(arg(args, "--port", 8000))
     cc = json.loads(arg(args, "--compilation-config", "{}"))
     eager = "--enforce-eager" in args or cc.get("mode") == 0 and False
@@ -162,7 +169,14 @@ def serve(args):
                 if apc:
                     state["cache"].update(blocks)
             ttft = prefill * (len(toks) - hits * 16) * (1 + active / 32) + 0.002
+            sat = int(os.environ.get("FAKE_VLLM_SATURATE", "0") or 0)   # KV "full" above this many requests
+            if sat and active > sat:
+                ttft *= active / sat
+                with lock:
+                    state["preempt"] += 1
             per_tok = tpot * (1 + active / 64) * (1 + random.uniform(-jitter, jitter))
+            if sat and active > sat:
+                per_tok *= active / sat          # throughput stops growing past the limit
             accept = 0.0
             if spec and not isinstance(prompt, list) or (spec and isinstance(prompt, list) and len(toks) < 200):
                 accept = 0.6          # text prompts: drafts get accepted

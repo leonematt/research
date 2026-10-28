@@ -127,7 +127,10 @@ def unit() -> None:
     check(tailor.lower_gpu_mem(sc, 0.78, raise_=True) == 0.66, "cache-starved retry raises the fraction")
     check(not sampling.is_quiet([0.0], sampling.Policy(2, 4, 0.05)) and sampling.is_quiet([0.0, 0.01], sampling.Policy(2, 4, 0.05))
           and not sampling.is_quiet([0.0, 0.04], sampling.Policy(2, 4, 0.05)), "quiet config detected after 2 calm workloads")
-    kept, dropped = tailor.fit_workloads(build_workloads("standard", 8192, quiet=True), card, 4.0, quiet=True)
+    kept, dropped = tailor.fit_workloads(build_workloads("standard", 8192, quiet=True), card, 4.0, quiet=True,
+                                         drop_grid=True)
+    keep_all, none = tailor.fit_workloads(build_workloads("standard", 8192, quiet=True), card, 4.0, quiet=True)
+    check(not none and any(w.concurrency == 128 for w in keep_all), "by default every grid shape stays in the plan")
     check(any(w.concurrency == 128 for w in dropped) and any(w.kind == "reference" for w in kept),
           "shapes far beyond KV capacity dropped, reference kept")
     kinds = {w.kind for w in kept}
@@ -138,6 +141,61 @@ def unit() -> None:
     check(mx.concurrency < 64 and tailor.kv_demand(mx) <= 4 * card.kv_tokens_est, "mixed concurrency scaled to fit")
     check(tailor.lower_gpu_mem(plain, 0.79) == 0.75 and tailor.lower_gpu_mem(plain, 0.79) == 0.71, "OOM retry steps down")
     del os.environ["LLMBENCH_KV_BYTES_PER_TOKEN"]
+
+    print("unit: context fit for draft-model configs")
+    log = "ValueError: To serve at least one request with the model's max seq len (8192), (2.0 GiB KV cache is needed"
+    check(tailor.oom_kind(log) == "starved", "context-starved error recognized")
+    sd = Config("spec_draft", "vllm", "component", [], "", args=["--speculative-config",
+                '{"model": "Qwen/Qwen3-0.6B", "num_speculative_tokens": 4}'])
+    wl = build_workloads("standard", 8192, quiet=True)
+    small = [w for w in wl if w.kind in ("reference", "text")]
+    tailor.fit_context([sd, Config("vllm_default", "vllm", "default", [], "")], lambda c: small, 8192, card, quiet=True)
+    check(sd.args[sd.args.index("--max-model-len") + 1] == "2048", "draft config's context fitted to its workloads (2048)")
+    check(tailor.shrink_context(sd, 8192, tailor.context_needed(small)) is None, "context never shrinks below what workloads need")
+    big = Config("x", "vllm", "component", [], "")
+    check(tailor.shrink_context(big, 8192, 2048) == 4096 and tailor.shrink_context(big, 8192, 2048) == 2048
+          and tailor.shrink_context(big, 8192, 2048) is None, "starved retry halves the context down to the floor")
+
+    print("unit: sweep stops at the card's limit")
+    from llmbench import sweep
+    from llmbench.workloads import Workload
+    ws = [Workload(f"c{c}", 1024, 256, c, 8) for c in (1, 2, 4, 8, 16, 32, 64, 128)]
+    by = {w.name: w for w in ws}
+    ok = lambda thr, pre=0: [dict(output_throughput=thr, preemptions=pre)]
+    rows = {"c1": ok(90), "c2": ok(170), "c4": ok(320), "c8": ok(500), "c16": ok(800), "c32": ok(835, 21)}
+    check(sweep.skip_reason(by["c64"], rows, by) and sweep.skip_reason(by["c128"], rows, by)
+          and "saturated" in sweep.skip_reason(by["c64"], rows, by), "vLLM: flat throughput + preemptions -> skip larger")
+    rows2 = {"c1": ok(90), "c2": ok(170), "c4": ok(320), "c8": ok(500), "c16": ok(800), "c32": ok(1400, 5)}
+    check(sweep.skip_reason(by["c64"], rows2, by) is None, "still scaling -> keep going even with some preemption")
+    cb = lambda thr: [dict(output_throughput=thr, preemptions=float("nan"))]      # transformers CB: no counter
+    check("queue" in (sweep.skip_reason(by["c128"], {"c16": cb(560), "c32": cb(640), "c64": cb(654)}, by) or ""),
+          "continuous batching without a preemption counter: flat throughput alone -> skip")
+    check(sweep.skip_reason(by["c64"], {"c16": cb(400), "c32": cb(640)}, by) is None, "...but not while still scaling")
+    tmpd = Path(tempfile.mkdtemp())
+    (tmpd / "x__w__r0.row.json").write_text("")
+    from llmbench.util import read_row
+    check(read_row(tmpd / "x__w__r0.row.json") is None and (tmpd / "corrupt" / "x__w__r0.row.json").exists(),
+          "empty row file (power loss) is set aside, not fatal")
+    shutil.rmtree(tmpd)
+    oom = [dict(bench_rc=1.0, bench_error="OOM: CUDA out of memory", oom_v=sweep.OOM_TAG)]
+    rows3 = {"c1": ok(20), "c2": ok(38), "c4": ok(70), "c8": oom}
+    check("c=8 ran out of memory" in (sweep.skip_reason(by["c16"], rows3, by) or ""), "PyTorch: OOM at c=8 -> skip c>=16")
+    old_oom = [dict(bench_rc=1.0, bench_error="OOM: CUDA out of memory")]          # from before the leak fix
+    check(sweep.skip_reason(by["c16"], {"c8": old_oom}, by) is None, "untrusted (pre-fix) OOMs don't stop the sweep")
+
+    print("unit: retry repeats supersede suspect ones")
+    import pandas as pd
+    from llmbench.results import aggregate
+    rd = Path(tempfile.mkdtemp()); (rd / "raw").mkdir()
+    import json as _j
+    for rep, thr, retry in ((0, 150.0, 0), (1, 600.0, 0), (2, 160.0, 0), (3, 434.0, 1), (4, 422.0, 1), (5, 436.0, 1)):
+        (rd / "raw" / f"c__w__r{rep}.row.json").write_text(_j.dumps(dict(
+            config="c", workload="w", repeat=rep, output_throughput=thr, bench_rc=0.0, retry=float(retry))))
+    aggregate(rd)
+    agg = pd.read_csv(rd / "results.csv").iloc[0]
+    check(agg["output_throughput"] == 434.0 and agg["n_repeats"] == 3 and agg["superseded_repeats"] == 3
+          and agg["cv_output_throughput"] < 0.02, "median/CV come from the 3 consistent retry repeats only")
+    shutil.rmtree(rd)
 
     print("unit: anomaly walk")
     import pandas as pd
@@ -187,7 +245,7 @@ def e2e() -> None:
     rd = runs[0]
     import pandas as pd
     for f in ("results_long.csv", "optimizations.csv", "category_summary.csv", "headline.csv", "ladder.csv",
-              "kernel_breakdown.csv", "anomalies.csv", "report.md"):
+              "kernel_breakdown.csv", "anomalies.csv", "report.md", "dashboard.html"):
         check((rd / f).exists() and (rd / f).stat().st_size > 50, f"{f} written")
     check("[rebuild] vllm_minimal" in log, "composite rebuilt after a rejected flag")
     sd = s_ = json.loads((rd / "summary.json").read_text())["server_facts"].get("spec_draft", {})
@@ -200,8 +258,17 @@ def e2e() -> None:
     check(("pt_cb", "partial") in got, "failed repeat flagged as partial")
     check(an[(an["config"] == "pt_cb")]["outcome"].eq("resolved").all(), "pt_cb retry resolved it")
     res = pd.read_csv(rd / "results.csv")
-    bs = res[res["config"] == "block_size_32"]
-    check(len(bs) and bs["n_repeats"].max() > 2, "noisy config got extra adaptive repeats")
+    # adaptive rule: a workload whose first two repeats differ by > 5% gets more (the stub's noise is
+    # random, so check the rule itself rather than assume a particular draw was noisy)
+    import statistics
+    allr = pd.read_csv(rd / "results_all.csv")
+    ok_rule = True
+    for _, g in allr[(allr["config"] == "block_size_32") & (allr["status"] == "ok")].groupby("workload"):
+        thr = list(g.sort_values("repeat")["output_throughput"])
+        if len(thr) >= 2:
+            spread = statistics.stdev(thr[:2]) / statistics.fmean(thr[:2])
+            ok_rule &= (len(thr) > 2) == (spread > 0.05) or len(thr) >= 4
+    check(ok_rule, "adaptive repeats follow the CV rule on a noisy config")
     check((rd / "raw" / "retired").exists(), "failed repeats retired, not deleted")
     long = pd.read_csv(rd / "results_long.csv")
     check({"engine", "tier", "categories", "metric", "value", "unit"} <= set(long.columns), "long CSV has labels")
@@ -212,10 +279,20 @@ def e2e() -> None:
     check(len(sp) == 1 and sp["ttft_x_focus"].iloc[0] > 1.2, "prefix caching cuts TTFT on the shared-prefix workload")
     kb = pd.read_csv(rd / "kernel_breakdown.csv")
     check(set(kb["kernel_class"]) >= {"gemm", "attention"}, "kernel breakdown classified")
+    dash = (rd / "dashboard.html").read_text() if (rd / "dashboard.html").exists() else ""
+    check("/*__DATA__*/null" not in dash and '"views"' in dash and '"points"' in dash, "dashboard has its data embedded")
     # rebuild from raw files
     r2 = subprocess.run([sys.executable, "-m", "llmbench", "report", rd.name, "--out", str(out), "--no-plots"],
                         cwd=ROOT, env=env, capture_output=True, text=True)
     check(r2.returncode == 0, "report rebuilds from raw/")
+    check((rd / "engine_matrix.csv").exists(), "engine_matrix.csv written")
+    check('"matrix"' in dash, "dashboard carries the 2x2 matrix")
+    r3 = subprocess.run([sys.executable, "-m", "llmbench", "report", rd.name, "--out", str(out)],
+                        cwd=ROOT, env=env, capture_output=True, text=True)
+    pngs = {p.name for p in (rd / "plots").glob("*.png")} if (rd / "plots").exists() else set()
+    check(r3.returncode == 0 and "skipped" not in r3.stdout and "frontier_vllm.png" in pngs
+          and "frontier_vllm_first_vs_last.png" in pngs and "stages_vllm.png" in pngs,
+          f"static images written (got {sorted(pngs)}; {r3.stdout[-300:]})")
     if not FAILS:
         shutil.rmtree(out)
 
