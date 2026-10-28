@@ -12,12 +12,13 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from . import sampling
+from . import sampling, sweep
 from .configs import Config, select_workloads
 from .hardware import Hardware
 from .models import derived
 from .results import aggregate, base_row, write_row
-from .util import drop_page_cache
+from .util import drop_page_cache, read_row
+from .torch_worker import EXIT_RESTART
 from .vllm_runner import explain_failure
 from .workloads import Workload
 
@@ -115,8 +116,41 @@ def run_pytorch(a: argparse.Namespace, run_dir: Path, cfgs: list[Config], wls: l
             plan.append((c, cw))
     eta = sampling.ETA(sum(len(w) for _, w in plan) * (a.min_repeats if targets is None else 1) + len(plan))
     print(f"\n[pytorch] {'retry' if targets is not None else 'sweep'}: {len(plan)} configs -> {run_dir}\n")
+    policy = sampling.Policy(a.min_repeats, a.max_repeats, a.target_cv)
+
+    def config_done(c: Config, cwls: list[Workload]) -> bool:
+        """Enough good repeats everywhere (quiet downshift included). An OOM row doesn't count, so
+        a resumed run retries OOMs once (they may have come from a since-fixed memory leak)."""
+        cvs: list[float] = []
+        rows_now = sweep.load_rows(raw, c.name, cwls)
+        by_name = {x.name: x for x in wls}
+        for w in cwls:
+            if any(sweep.is_skip_row(r) for r in rows_now.get(w.name, [])) or sweep.skip_reason(w, rows_now, by_name):
+                continue
+            have = []
+            for f in raw.glob(f"{c.name}__{w.name}__r*.row.json"):
+                try:
+                    r = read_row(f)
+                    if r is not None:
+                        have.append(r)
+                except Exception:  # noqa: BLE001
+                    pass
+            if have and all(str(r.get("bench_error", "")).startswith("OOM: static batch") for r in have):
+                continue          # computed up front from the KV size: retrying can't change it
+            p = sampling.Policy(1, policy.max_repeats, policy.target_cv) if sampling.is_quiet(cvs, policy) else policy
+            if sampling.need_more(have, len(have), p):
+                return False
+            cv = sampling.cv([r.get("output_throughput") for r in have if sampling.good(r)])
+            if cv == cv:
+                cvs.append(cv)
+        return True
+
     for i, (c, cwls) in enumerate(plan, 1):
         print(f"=== [{i}/{len(plan)}] {c.name}  ({c.tier}: {c.knob})  {eta}", flush=True)
+        if targets is None and a.resume and config_done(c, cwls):
+            print("  all results present, reusing (no model load)")
+            eta.tick()
+            continue
         log = logs / f"{c.name}.log"
         fpath = raw / f"{c.name}__facts.json"
         fpath.unlink(missing_ok=True)
@@ -129,11 +163,18 @@ def run_pytorch(a: argparse.Namespace, run_dir: Path, cfgs: list[Config], wls: l
             ret = raw / "retired"
             for w in cwls:
                 for f in raw.glob(f"{c.name}__{w.name}__r*.row.json"):
-                    r = json.loads(f.read_text())
+                    r = read_row(f)
+                    if r is None:
+                        continue
                     if not sampling.good(r) and not str(r.get("bench_error", "")).startswith("OOM"):
                         ret.mkdir(exist_ok=True)
                         f.replace(ret / f.name)
         todo = list(cwls)
+
+        def n_rows(w: Workload) -> int:
+            return len(list(raw.glob(f"{c.name}__{w.name}__r*.row.json")))
+
+        start_rows = {w.name: n_rows(w) for w in cwls}     # progress is measured against this session
         t0, attempt, idle, crashes, rc = time.perf_counter(), 0, 0, [], 0
         n_before = len(list(raw.glob(f"{c.name}__*.row.json")))
         with open(log, "a" if targets is not None else "w") as lf:
@@ -176,11 +217,15 @@ def run_pytorch(a: argparse.Namespace, run_dir: Path, cfgs: list[Config], wls: l
                 lf.flush()
 
                 def finished(w: Workload) -> bool:
-                    return any(raw.glob(f"{c.name}__{w.name}__r*.row.json"))
+                    return n_rows(w) > start_rows[w.name]
 
                 done = [w for w in todo if finished(w)]
                 if rc == 0:
                     break
+                if rc == EXIT_RESTART:      # the worker hit a real OOM and wants a clean GPU
+                    todo = [w for w in todo if not finished(w)]
+                    idle = 0
+                    continue
                 # A hard crash (host OOM-kill, CUDA context poisoned, segfault) lost the workload in flight.
                 # Record it as failed and continue the rest in a fresh process.
                 todo = [w for w in todo if not finished(w)] if targets is None else \

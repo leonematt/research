@@ -72,6 +72,11 @@ def write_report(run_dir: Path, make_plots: bool = True) -> None:
     else:
         out.append("_no anchors measured_\n")
 
+    # 1b. the 2x2: PyTorch vs vLLM, not optimized vs optimized
+    em = _read(run_dir, "engine_matrix.csv")
+    if em is not None and len(em):
+        out += engine_matrix_section(em, summary)
+
     # 2. breakdown by category
     cs = _read(run_dir, "category_summary.csv")
     out.append("## 2. Optimization breakdown by category\n")
@@ -182,7 +187,7 @@ def write_report(run_dir: Path, make_plots: bool = True) -> None:
     # 8. failures
     adf = _read(run_dir, "results_all.csv")
     fails = [(n, f) for n, f in summary.get("server_facts", {}).items() if f.get("status") != "ok"]
-    bench_fail = adf[adf["status"] != "ok"] if adf is not None and "status" in adf else []
+    bench_fail = adf[~adf["status"].isin(["ok", "skipped"])] if adf is not None and "status" in adf else []
     if fails or len(bench_fail):
         out.append("## 8. Failures\n")
         for n, f in fails:
@@ -194,11 +199,72 @@ def write_report(run_dir: Path, make_plots: bool = True) -> None:
 
     (run_dir / "report.md").write_text("\n".join(out))
     print(f"[report] wrote {run_dir / 'report.md'}")
+    try:
+        from .dashboard import write_dashboard
+        d = write_dashboard(run_dir)
+        if d:
+            print(f"[dashboard] wrote {d}  (open it in a browser)")
+    except Exception as e:  # noqa: BLE001
+        print(f"[dashboard] skipped: {type(e).__name__}: {e}")
     if make_plots:
         try:
             plots(run_dir, summary)
         except Exception as e:  # noqa: BLE001
             print(f"[plots] skipped: {type(e).__name__}: {e}")
+
+
+MATRIX_SHOW = [("output_throughput_per_gpu", "Output tok/s per GPU", "{:,.0f}"),
+               ("median_ttft_ms", "TTFT p50 (ms)", "{:,.0f}"),
+               ("median_tpot_ms", "TPOT p50 (ms)", "{:,.1f}"),
+               ("median_e2el_ms", "E2E p50 (ms)", "{:,.0f}"),
+               ("peak_mem_gib", "Peak memory (GiB)", "{:,.1f}")]
+
+
+def _cell(r, side, ff):
+    v = r.get(side)
+    if is_num(v):
+        return ff.format(float(v))
+    st = str(r.get(side + "_status") or "")
+    return "OOM" if st == "oom" else "saturated" if st == "skipped" else "–"
+
+
+def _x(v):
+    return f"×{float(v):.2f}" if is_num(v) else "–"
+
+
+def engine_matrix_section(em, summary: dict) -> list[str]:
+    """2x2 tables (engine x optimization) at a few representative operating points."""
+    rin, rout, rc = summary["reference"]
+    pts = []
+    grid = em[em["kind"].isin(["grid", "reference"]) & (em["input_len"] == rin) & (em["output_len"] == rout)]
+    for c in sorted({1, 8, int(rc)}):
+        if (grid["concurrency"] == c).any():
+            pts.append(grid[grid["concurrency"] == c])
+    text1 = em[(em["kind"] == "text") & (em["concurrency"] == 1)]
+    if len(text1):
+        pts.append(text1)
+    out = ["## 1b. PyTorch vs vLLM: not optimized vs optimized\n",
+           "Baseline = `pt_eager` / `vllm_minimal`. Optimized = the better of each engine's optimized configs at that "
+           "point (named under the table): `pt_optimized` (static batching) or `pt_serve_optimized` (continuous "
+           "batching); `vllm_optimized` or `vllm_optimized_spec`. Gains are oriented so ×>1 is better (for "
+           "latencies, how many times lower). Every shape and concurrency is in `engine_matrix.csv`.\n"]
+    for sub in pts:
+        sub = sub.set_index("metric")
+        lab = sub["workload_label"].iloc[0]
+        lines = ["| metric | PyTorch baseline | PyTorch optimized | vLLM baseline | vLLM optimized | "
+                 "PyTorch gain | vLLM gain | vLLM ÷ PyTorch (optimized) |", "|---|---|---|---|---|---|---|---|"]
+        for m, label, ff in MATRIX_SHOW:
+            if m not in sub.index:
+                continue
+            r = sub.loc[m]
+            lines.append(f"| {label} | {_cell(r, 'pytorch_baseline', ff)} | {_cell(r, 'pytorch_optimized', ff)} | "
+                         f"{_cell(r, 'vllm_baseline', ff)} | {_cell(r, 'vllm_optimized', ff)} | "
+                         f"{_x(r.get('pytorch_optimization_x'))} | {_x(r.get('vllm_optimization_x'))} | "
+                         f"{_x(r.get('vllm_vs_pytorch_optimized_x'))} |")
+        r0 = sub.iloc[0]
+        who = f"PyTorch optimized = `{r0.get('pytorch_optimized_config')}`, vLLM optimized = `{r0.get('vllm_optimized_config')}`"
+        out += [f"### `{lab}`\n", "\n".join(lines) + "\n", who + "\n"]
+    return out
 
 
 def plots(run_dir: Path, summary: dict) -> None:
@@ -217,7 +283,7 @@ def plots(run_dir: Path, summary: dict) -> None:
             d["label"] = d["category_label"] + " · " + d["engine"] + " · " + d["what"].str.slice(0, 40)
             d = d.iloc[::-1]
             fig, ax = plt.subplots(figsize=(10, max(3, 0.32 * len(d))))
-            colors = ["#2a9d8f" if x >= 1 else "#e76f51" for x in d["throughput_x_focus"]]
+            colors = ["#2a78d6" if x >= 1 else "#d03b3b" for x in d["throughput_x_focus"]]
             ax.barh(d["label"], d["throughput_x_focus"], color=colors)
             ax.axvline(1.0, color="#333", lw=0.8)
             ax.set_xscale("log")
@@ -225,46 +291,14 @@ def plots(run_dir: Path, summary: dict) -> None:
             ax.set_title("Optimization breakdown")
             ax.tick_params(axis="y", labelsize=7)
             fig.tight_layout()
-            fig.savefig(pdir / "optimization_breakdown.png", dpi=130)
+            fig.savefig(pdir / "optimization_breakdown.png", dpi=160)
             plt.close(fig)
             n += 1
-    lad = _read(run_dir, "ladder.csv")
-    if lad is not None and len(lad):
-        for lname, g in lad.groupby("ladder"):
-            s = g[(g["metric"] == "output_throughput") & (g["workload_label"] == ref)]
-            if len(s) < 2:
-                continue
-            fig, ax = plt.subplots(figsize=(9, 4))
-            ax.bar(range(len(s)), s["value"], color="#264653")
-            ax.set_xticks(range(len(s)))
-            ax.set_xticklabels(s["added"], rotation=30, ha="right", fontsize=7)
-            ax.set_ylabel("output tok/s")
-            ax.set_title(f"{lname} ladder at {ref}")
-            fig.tight_layout()
-            fig.savefig(pdir / f"ladder_{lname}.png", dpi=130)
-            plt.close(fig)
-            n += 1
-    head = _read(run_dir, "headline.csv")
-    if head is not None and len(head):
-        rin, rout, _ = summary["reference"]
-        sub = head[(head["input_len"] == rin) & (head["output_len"] == rout) & head["kind"].isin(["grid", "reference"])]
-        if len(sub):
-            fig, ax = plt.subplots(figsize=(9, 5))
-            for anchor, g in sub.groupby("anchor"):
-                if anchor.endswith("_best"):
-                    continue
-                g = g.drop_duplicates("concurrency").sort_values("concurrency")
-                ax.plot(g["concurrency"], g["output_throughput"], marker="o", label=anchor)
-            ax.set_xscale("log", base=2)
-            ax.set_xlabel("concurrency")
-            ax.set_ylabel("output tok/s")
-            ax.set_title(f"Baselines vs optimized: throughput vs concurrency (in={rin}, out={rout})")
-            ax.grid(alpha=.3)
-            ax.legend(fontsize=8)
-            fig.tight_layout()
-            fig.savefig(pdir / "anchors_throughput_vs_concurrency.png", dpi=130)
-            plt.close(fig)
-            n += 1
+    from .figures import write_figures
+    try:
+        n += write_figures(run_dir, summary)
+    except Exception as e:  # noqa: BLE001
+        print(f"[plots] frontier figures skipped: {type(e).__name__}: {e}")
     kb = _read(run_dir, "kernel_breakdown.csv")
     if kb is not None and len(kb):
         p = kb.pivot_table(index="config", columns="kernel_class", values="pct_of_gpu_time", aggfunc="first").fillna(0)

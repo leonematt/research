@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Optional
 
 from .taxonomy import CATEGORY_LABEL, CATEGORY_ORDER, COMPARE_METRICS, METRICS, all_comparisons
-from .util import is_num
+from .util import is_num, durable_write, read_row
 
 LONG_METRICS = list(METRICS)
 # columns that identify a (config, workload) pair; everything else in a row is a measurement
@@ -45,22 +45,24 @@ def base_row(cfg, wl, model: str, rep: int, gpu_count: int) -> dict:
 
 def write_row(raw_dir: Path, row: dict) -> None:
     name = f"{row['config']}__{row['workload']}__r{int(row.get('repeat') or 0)}.row.json"
-    tmp = raw_dir / (name + ".tmp")
-    tmp.write_text(json.dumps(row, default=float))
-    tmp.replace(raw_dir / name)
+    durable_write(raw_dir / name, json.dumps(row, default=float))
 
 
 def load_rows(run_dir: Path) -> list[dict]:
     rows = []
     for f in sorted((run_dir / "raw").glob("*.row.json")):
         try:
-            rows.append(json.loads(f.read_text()))
+            r = read_row(f)
+            if r is not None:
+                rows.append(r)
         except Exception:  # noqa: BLE001
             pass
     return rows
 
 
 def _status(r: dict) -> str:
+    if r.get("skipped"):
+        return "skipped"          # past this config's limit on this shape (see sweep.py)
     if not r.get("bench_rc") and is_num(r.get("output_throughput")):
         return "ok"
     err = str(r.get("bench_error") or "")
@@ -84,7 +86,17 @@ def aggregate(run_dir: Path) -> None:
 
     key = ["config", "workload"]
     out = []
+    has_retry = "retry" in all_df.columns
     for (_cfg, _wl), g in all_df.groupby(key, sort=False):
+        superseded = 0
+        if has_retry:
+            # A retry runs because the earlier data for this pair was suspect (failures, noise, a
+            # regression). Once it has produced >= 2 good repeats, those replace the older repeats in
+            # the aggregate; the older rows stay in results_all.csv / raw/ for the audit trail.
+            rg = g[g["retry"].fillna(0).astype(float) > 0]
+            if int((rg["status"] == "ok").sum()) >= 2:
+                superseded = int(len(g) - len(rg))
+                g = rg
         ok = g[g["status"] == "ok"]
         src = ok if len(ok) else g
         rec = {}
@@ -104,6 +116,7 @@ def aggregate(run_dir: Path) -> None:
         thr = ok["output_throughput"].dropna() if "output_throughput" in ok else []
         rec["cv_output_throughput"] = float(thr.std() / thr.mean()) if len(thr) >= 2 and thr.mean() else float("nan")
         rec["retried"] = int(bool(g.get("retry", pd.Series(dtype=float)).fillna(0).astype(float).sum()))
+        rec["superseded_repeats"] = superseded
         out.append(rec)
     agg = pd.DataFrame(out)
     front = [c for c in ["config", "workload", "status", "n_repeats", "n_failed", "cv_output_throughput"] if c in agg]
@@ -382,6 +395,71 @@ def write_kernel_breakdown(run_dir: Path, summary: dict) -> None:
         pd.DataFrame(rows).to_csv(run_dir / "kernel_breakdown.csv", index=False)
 
 
+# PyTorch vs vLLM x not optimized vs optimized. "Optimized" is the better of each engine's optimized
+# configs at each operating point (by output throughput), named in the *_config column.
+MATRIX_SIDES = {
+    "pytorch_baseline": ["pt_eager"],
+    "pytorch_optimized": ["pt_optimized", "pt_serve_optimized"],
+    "vllm_baseline": ["vllm_minimal"],
+    "vllm_default": ["vllm_default"],
+    "vllm_optimized": ["vllm_optimized", "vllm_optimized_spec"],
+}
+MATRIX_METRICS = ["output_throughput_per_gpu", "output_throughput", "request_throughput", "median_ttft_ms",
+                  "p99_ttft_ms", "median_tpot_ms", "median_e2el_ms", "peak_mem_gib"]
+
+
+def engine_matrix(df) -> list[dict]:
+    """One row per (workload, metric) with the four corners + vLLM default and the gains between
+    them (speedups oriented so > 1 is better)."""
+    rows = []
+    for wl, g in df.groupby("workload", sort=False):
+        g = g.set_index("config")
+        first = g.iloc[0]
+        pick, status = {}, {}
+        for side, cands in MATRIX_SIDES.items():
+            have = [c for c in cands if c in g.index]
+            ok = [c for c in have if g.loc[c, "status"] == "ok" and is_num(g.loc[c].get("output_throughput"))]
+            if ok:
+                pick[side] = max(ok, key=lambda c: g.loc[c, "output_throughput"])
+                status[side] = "ok"
+            else:
+                pick[side] = have[0] if have else None
+                status[side] = (str(g.loc[have[0], "status"]) if have else "not run")
+        if not any(status[s] == "ok" for s in MATRIX_SIDES):
+            continue
+        for m in MATRIX_METRICS:
+            if m not in g.columns:
+                continue
+            vals = {s: (g.loc[pick[s], m] if status[s] == "ok" and pick[s] is not None else float("nan"))
+                    for s in MATRIX_SIDES}
+            if not any(is_num(v) for v in vals.values()):
+                continue
+            sp = lambda a, b: _speedup(m, vals[a], vals[b])  # noqa: E731
+            r = dict(workload=wl, workload_label=first.get("workload_label"), kind=first.get("kind"),
+                     input_len=first.get("input_len"), output_len=first.get("output_len"),
+                     concurrency=first.get("concurrency"), metric=m, metric_label=METRICS[m][0],
+                     unit=METRICS[m][2], higher_is_better=METRICS[m][1])
+            for side in MATRIX_SIDES:
+                r[side] = vals[side]
+                r[side + "_config"] = pick[side]
+                r[side + "_status"] = status[side]
+            r.update(pytorch_optimization_x=sp("pytorch_baseline", "pytorch_optimized"),
+                     vllm_optimization_x=sp("vllm_baseline", "vllm_optimized"),
+                     vllm_vs_pytorch_baseline_x=sp("pytorch_baseline", "vllm_baseline"),
+                     vllm_vs_pytorch_optimized_x=sp("pytorch_optimized", "vllm_optimized"),
+                     end_to_end_x=sp("pytorch_baseline", "vllm_optimized"))
+            rows.append(r)
+    return rows
+
+
+def write_engine_matrix(run_dir: Path, df, summary: dict) -> None:
+    import pandas as pd
+
+    rows = engine_matrix(df)
+    labels = _run_labels(summary)
+    pd.DataFrame([{**labels, **r} for r in rows]).to_csv(run_dir / "engine_matrix.csv", index=False)
+
+
 def write_all(run_dir: Path) -> None:
     """Every derived CSV from results.csv + summary.json."""
     import pandas as pd
@@ -397,9 +475,10 @@ def write_all(run_dir: Path) -> None:
     write_headline(run_dir, df, summary)
     write_ladder(run_dir, df, summary)
     write_kernel_breakdown(run_dir, summary)
+    write_engine_matrix(run_dir, df, summary)
 
 
-CSV_FILES = ["results_long.csv", "optimizations.csv", "category_summary.csv", "headline.csv", "ladder.csv",
+CSV_FILES = ["engine_matrix.csv", "results_long.csv", "optimizations.csv", "category_summary.csv", "headline.csv", "ladder.csv",
              "kernel_breakdown.csv", "anomalies.csv", "results.csv"]
 
 

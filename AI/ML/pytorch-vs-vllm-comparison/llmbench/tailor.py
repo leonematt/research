@@ -122,7 +122,8 @@ def kv_demand(w) -> int:
     return w.concurrency * w.total_len
 
 
-def fit_workloads(wls: list, card: CardProfile, oversub: float, quiet: bool = False) -> tuple[list, list]:
+def fit_workloads(wls: list, card: CardProfile, oversub: float, quiet: bool = False,
+                  drop_grid: bool = False) -> tuple[list, list]:
     """Make closed-loop shapes fit the card's KV cache (at most `oversub` x the estimated capacity
     in flight); past that point vLLM just queues and preempts and the run measures a waiting line.
       * grid points that don't fit are dropped: the rest of the grid still covers the trend;
@@ -138,6 +139,9 @@ def fit_workloads(wls: list, card: CardProfile, oversub: float, quiet: bool = Fa
     for w in wls:
         if w.kind == "reference" or not w.closed_loop or w.kind in ("text", "sharegpt") or kv_demand(w) <= cap:
             kept.append(w)
+            continue
+        if w.kind == "grid" and not drop_grid:
+            kept.append(w)       # the sweep stops at runtime where each config hits its limit (sweep.py)
             continue
         if w.kind in ("prefix", "mixed"):
             old = w.concurrency
@@ -157,14 +161,69 @@ def fit_workloads(wls: list, card: CardProfile, oversub: float, quiet: bool = Fa
 
 
 CACHE_STARVED = "No available memory for the cache blocks"
+# vLLM refuses to start unless one request of max_model_len fits in the KV pool
+CTX_STARVED = "To serve at least one request with the model's max seq len"
 
 
 def oom_kind(log_text: str) -> Optional[str]:
-    """'starved': the budget left nothing for KV (raise the fraction); 'device': the process outgrew
-    the GPU (lower it); None: not a memory failure."""
-    if CACHE_STARVED in log_text:
+    """'starved': the KV pool is too small for the budget (shrink the context, else raise the
+    fraction); 'device': the process outgrew the GPU (lower it); None: not a memory failure."""
+    if CACHE_STARVED in log_text or CTX_STARVED in log_text:
         return "starved"
     return "device" if any(m in log_text for m in OOM_MARKERS if m != CACHE_STARVED) else None
+
+
+def context_needed(wls: list) -> Optional[int]:
+    """Smallest power-of-two context (>= 2048) that holds every workload in wls; None when a
+    workload's length isn't known in advance (ShareGPT)."""
+    if not wls or any(w.kind == "sharegpt" for w in wls):
+        return None
+    need = max(w.total_len for w in wls)
+    n = 2048
+    while n < need:
+        n *= 2
+    return n
+
+
+def _mml(cfg, base: int) -> int:
+    a = cfg.args
+    return int(a[a.index("--max-model-len") + 1]) if "--max-model-len" in a else int(base)
+
+
+def set_context(cfg, n: int) -> None:
+    a = cfg.args
+    if "--max-model-len" in a:
+        i = a.index("--max-model-len")
+        cfg.args = a[:i + 1] + [str(n)] + a[i + 2:]
+    else:
+        cfg.args = a + ["--max-model-len", str(n)]
+
+
+def fit_context(cfgs: list, wls_for, base_mml: int, card: CardProfile, quiet: bool = False) -> None:
+    """Configs that load a second model get a context sized to the workloads they actually run.
+    vLLM refuses to start unless one max_model_len request fits in the KV pool, and on a small card
+    a draft model leaves too little for a full context. The KV pool itself is unchanged, and no
+    request a config sends ever exceeds the smaller context, so the measurements are unaffected."""
+    for c in cfgs:
+        if c.engine != "vllm" or headroom_gib(c, card)[0] < 0.5 or "--max-model-len" in c.args:
+            continue
+        n = context_needed(wls_for(c))
+        if n and n < base_mml:
+            set_context(c, n)
+            c.note = (c.note + "; " if c.note else "") + f"max_model_len {base_mml} -> {n} (its longest workload fits)"
+            if not quiet:
+                print(f"[tailor] {c.name}: max_model_len {base_mml} -> {n} (longest workload it runs fits; "
+                      "leaves room for the draft model)")
+
+
+def shrink_context(cfg, base_mml: int, floor: Optional[int]) -> Optional[int]:
+    """Halve the config's context, not below what its workloads need; None if it can't shrink."""
+    cur = _mml(cfg, base_mml)
+    new = cur // 2
+    if not floor or new < floor:
+        return None
+    set_context(cfg, new)
+    return new
 
 
 def is_oom(log_text: str) -> bool:

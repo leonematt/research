@@ -34,7 +34,7 @@ GRIDS: dict[str, dict] = {
     "check": dict(input_lens=[256], output_lens=[64], concurrencies=[1, 4],
                   reference=(256, 64, 4), prefix=(512, 128, 32, 4),
                   mixed=(256, 64, 4), text=(64, [1]), rates=[0.5]),
-    "quick": dict(input_lens=[256, 2048], output_lens=[256], concurrencies=[1, 16, 64],
+    "quick": dict(input_lens=[256, 2048], output_lens=[256], concurrencies=POW2,
                   reference=(2048, 256, 16), prefix=(2048, 256, 128, 16),
                   mixed=(1024, 256, 32), text=(256, [1, 16]), rates=[0.5, 1.0]),
     "standard": dict(input_lens=[256, 1024, 4096], output_lens=[256, 1024], concurrencies=POW2,

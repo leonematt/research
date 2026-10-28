@@ -459,7 +459,7 @@ def preflight(hw: Hardware, *, model: str, port: Optional[int], n_gpus: int, gpu
             if m["mem_available_gib"] < need:
                 problems.append(f"only {m['mem_available_gib']:.0f} GiB available but "
                                 f"--gpu-mem {gpu_mem} asks for {need:.0f} GiB of {hw.per_gpu_gib:.0f}")
-    else:
+    elif hw.source != "fake":   # a simulated box has no real GPU to check (don't read this machine's)
         ids = hw.smi_ids(n_gpus)
         apps = gpu_compute_apps(ids)
         busy = [r for r in apps if _ML_PROC.search(r["name"]) or (r["mib"] or 0) >= BUSY_MIB]

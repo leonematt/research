@@ -150,11 +150,44 @@ def md_table(df, floatfmt: str = "{:,.1f}", index: bool = True, index_name: str 
     return "\n".join(lines) + "\n"
 
 
-def write_json(path: Path, obj) -> None:
-    """Atomic-enough JSON write (temp file + rename) so a crash never leaves half a file."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=1, default=_json_default))
+def durable_write(path: Path, text: str) -> None:
+    """Write via temp file + fsync + rename: after a crash or power loss the file is either the old
+    version or the complete new one, never empty (rename alone can reach the disk before the data)."""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
     tmp.replace(path)
+
+
+def write_json(path: Path, obj) -> None:
+    durable_write(path, json.dumps(obj, indent=1, default=_json_default))
+
+
+_CORRUPT_WARNED: set = set()
+
+
+def read_row(path: Path) -> Optional[dict]:
+    """A raw/*.row.json, or None if it's unreadable (e.g. emptied by a power loss). Unreadable files
+    are moved to raw/corrupt/ so they're kept for inspection but never break a run again; the
+    measurement they held is simply re-run."""
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except Exception:  # noqa: BLE001
+        try:
+            d = path.parent / "corrupt"
+            d.mkdir(exist_ok=True)
+            path.replace(d / path.name)
+            if path.name not in _CORRUPT_WARNED:
+                _CORRUPT_WARNED.add(path.name)
+                print(f"  [warn] {path.name} was unreadable (empty/partial, e.g. after a power loss); "
+                      f"moved to {d}/ and that measurement will be re-run", flush=True)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
 
 def _json_default(o):

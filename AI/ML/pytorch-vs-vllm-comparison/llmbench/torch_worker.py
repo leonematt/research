@@ -25,12 +25,14 @@ import zlib
 from pathlib import Path
 
 from .metrics import parse_slo, summarize
+from .sweep import OOM_TAG, is_skip_row, load_rows, skip_reason
 from .results import write_row
 from .sampling import Policy, cv, good, is_quiet, need_more
-from .util import write_json
+from .util import read_row, write_json
 from .workloads import PromptSet, Workload, make_prompts, regular_vocab
 
 COMPILE_WARN_S = 1.0
+EXIT_RESTART = 75      # "continue the remaining workloads in a fresh process" (not a crash)
 
 
 class CompileLog:
@@ -59,6 +61,42 @@ class CompileLog:
     def within(self, t0: float, t1: float) -> tuple[int, float]:
         hit = [(s, e) for s, e in self.spans if e > t0 and s < t1]
         return len(hit), sum(min(e, t1) - max(s, t0) for s, e in hit)
+
+
+def release_gpu(model, compiled: bool) -> None:
+    """Free what the previous workload left on the GPU. transformers keeps the static KV cache it
+    allocated for the last shape on the model, and torch.compile(mode=reduce-overhead) keeps a CUDA
+    graph memory pool per captured shape. Across a sweep of shapes these stack up until perfectly
+    feasible batches OOM. Compiled graphs are dropped too: the next workload recompiles during its
+    own (unmeasured) warmup batch."""
+    import gc
+
+    import torch
+    for attr in ("_cache", "_static_cache", "_past_key_values"):
+        if hasattr(model, attr):
+            try:
+                delattr(model, attr)
+            except Exception:  # noqa: BLE001
+                pass
+    if compiled:
+        for attr in ("_compiled_call", "_compiled_forward"):
+            if hasattr(model, attr):
+                try:
+                    delattr(model, attr)
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            from torch._inductor import cudagraph_trees
+            cudagraph_trees.reset_cudagraph_trees()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            torch._dynamo.reset()
+        except Exception:  # noqa: BLE001
+            pass
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
 
 
 def has_accelerate() -> bool:
@@ -251,6 +289,11 @@ _FAKE_SPEED = {"pt_eager": 0.35, "pt_sdpa": 0.45, "pt_static": 0.5, "pt_compile_
 
 def fake_result(cfg_name: str, w: Workload, rep: int, seed: int) -> dict:
     rng = random.Random(zlib.crc32(f'{cfg_name}|{w.name}|{rep}|{seed}'.encode()))
+    above = int(os.environ.get("LLMBENCH_FAKE_OOM_ABOVE", "0") or 0)
+    if above and w.concurrency > above and cfg_name in ("pt_eager", "pt_static") and w.kind in ("grid", "reference"):
+        raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB (simulated)")
+    if f"{cfg_name}:{w.name}" in os.environ.get("LLMBENCH_FAKE_OOM", "").split(","):
+        raise RuntimeError("CUDA out of memory. Tried to allocate 608.00 MiB (simulated)")
     if os.environ.get("LLMBENCH_FAKE_FAIL") == f"{cfg_name}:{w.name}" and rep == 0:
         raise RuntimeError("simulated failure")
     noisy = os.environ.get("LLMBENCH_FAKE_NOISY") == f"{cfg_name}:{w.name}"
@@ -407,18 +450,37 @@ def main() -> None:
 
     policy = Policy(a.min_repeats, a.max_repeats, a.target_cv)
     quiet_cvs: list[float] = []
+    try:   # every workload of the run (this worker may only have the remaining ones), for sweep-stop
+        all_wls = [Workload.from_dict(x) for x in json.loads((run_dir / "summary.json").read_text())["workloads"]]
+    except Exception:  # noqa: BLE001
+        all_wls = list(wls)
+    wls_by_name = {x.name: x for x in all_wls}
     compiled_any = False
     compiles_total, compile_s_total = 0, 0.0
+    prev_shape = None
     for w in wls:
         if pt.get("assisted") and w.concurrency != 1:
             continue    # HF assisted generation is batch-size-1 only
+        if not fake and dev == "cuda" and prev_shape is not None:
+            release_gpu(model, compiled=bool(pt.get("compile")))   # a new shape: drop the last one's cache/graphs
+        prev_shape = w.name
         if os.environ.get("PT_TEST_CRASH_ON") == w.name:   # test hook: simulate a hard crash
             import signal
             os.kill(os.getpid(), signal.SIGKILL)
         have = {}
         for f in raw.glob(f"{cfg.name}__{w.name}__r*.row.json"):
-            r = json.loads(f.read_text())
-            have[int(r.get("repeat") or 0)] = r
+            r = read_row(f)
+            if r is not None:
+                have[int(r.get("repeat") or 0)] = r
+        if any(is_skip_row(r) for r in have.values()):
+            continue
+        reason = skip_reason(w, load_rows(raw, cfg.name, all_wls), wls_by_name)
+        if reason:
+            row = base_row(cfg, w, a.model, max(have, default=-1) + 1, gpu_count)
+            row.update(bench_rc=0.0, skipped=1.0, bench_error=f"SKIP: {reason}", client="pytorch")
+            write_row(raw, row)
+            print(f"PT| {w.label:<36} skipped: {reason}", flush=True)
+            continue
         if targets is None:
             pol, attempted0 = policy, len(have)
             if is_quiet(quiet_cvs, policy):
@@ -431,6 +493,7 @@ def main() -> None:
         while need_more(list(have.values()), attempted0 + attempted, pol):
             rep = max(have, default=-1) + 1
             row = base_row(cfg, w, a.model, rep, gpu_count)
+            gpu_oom = False
             t_wall = time.perf_counter()
             prof_path = None
             try:
@@ -484,7 +547,13 @@ def main() -> None:
                 if not fake and dev == "cuda":
                     torch.cuda.empty_cache()
                 if oom:
+                    row["oom_v"] = OOM_TAG          # measured on a clean GPU: larger concurrencies get skipped
                     attempted = 10 ** 6            # deterministic: don't repeat an OOM
+                    # A real CUDA OOM (not the up-front KV estimate) can leave tensors referenced inside
+                    # transformers / the compiler, so the next workload would start short of memory.
+                    # Finish this row, then exit so the runner continues in a fresh process.
+                    gpu_oom = not isinstance(e, MemoryError) and (not fake or bool(
+                        os.environ.get("LLMBENCH_FAKE_OOM") or os.environ.get("LLMBENCH_FAKE_OOM_ABOVE")))
             if not fake and dev == "cuda":
                 row["peak_mem_gib"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
             row["bench_wall_s"] = time.perf_counter() - t_wall
@@ -495,6 +564,11 @@ def main() -> None:
             write_row(raw, row)
             have[rep] = row
             attempted += 1
+            if gpu_oom:
+                facts["restarted_after_oom"] = facts.get("restarted_after_oom", 0) + 1
+                write_facts()
+                print(f"PT| {w.label:<36} restarting the worker for a clean GPU after this OOM", flush=True)
+                sys.exit(EXIT_RESTART)
             if prof_path is not None and prof_path.exists():
                 try:
                     from .profiling import breakdown

@@ -33,7 +33,7 @@ summarize the same data.
 | preset | grid | repeats | anomaly retries | typical time |
 |---|---|---|---|---|
 | `check` | tiny (in256/out64, c=1,4) | 1 | none | ~1 h for every config |
-| `quick` | in 256/2048 × out 256 × c 1/16/64 | 1 | 1 round | a few hours |
+| `quick` | in 256/2048 × out 256 × c 1–128 (powers of 2) | 1 | 1 round | a few hours |
 | `standard` | in 256/1024/4096 × out 256/1024 × c 1/2/4/8/16/32/64/128 | 2–4 adaptive | 1 round | overnight |
 | `full` | standard, **every** config on **every** workload | 2–5 adaptive | 2 rounds | a day+ |
 | `long` | in 1024/4096/16384 × out 256/1024 × c 1–128 (powers of 2) | 2–4 adaptive | 1 round | overnight |
@@ -80,10 +80,15 @@ and the top of every log show the decisions:
 * **OOM at startup → retry.** If a server still runs out of memory while starting, it is retried
   up to twice with the memory fraction 0.04 lower each time. The fraction actually used
   (`gpu_mem_used`) and `oom_retries` are recorded in the facts.
-* **Workloads the KV cache can hold.** KV capacity is estimated from the model's architecture.
-  Closed-loop shapes that would keep more than `--kv-oversub` (default 4) × that many tokens in
-  flight are dropped; past that point vLLM just queues and preempts, and the run would measure a
-  waiting line for hours. `--kv-oversub 0` keeps everything.
+* **Sweeps stop where the card does.** Every shape is swept over concurrency 1, 2, 4, 8, 16, 32, 64
+  and 128 in ascending order, and each config stops a shape as soon as going higher can't tell us
+  anything new. When a concurrency **runs out of memory** (PyTorch static batching), every larger one
+  is skipped. When the last step up **gained under 5% throughput while preempting** requests (vLLM
+  queues instead of failing), the shape has **saturated** and larger concurrencies are skipped. Skipped
+  points are kept as rows with status `skipped` and the reason, so charts show where each config hit
+  its limit. The one-of-a-kind workloads (`shared_prefix`, `mixed`) are scaled down to fit the
+  estimated KV capacity instead. `--pre-drop` restores the old behaviour of dropping oversized grid
+  shapes up front.
 
 ## Anomaly walk and auto-retry
 
@@ -161,13 +166,60 @@ The cumulative ladders:
 | `results_long.csv` | (config, workload, metric) | everything: filter by `engine`, `tier`, `categories`, `kind`, `concurrency`, `metric` |
 | `optimizations.csv` | (comparison, workload, metric) | speedup bars per category; `speedup_x` > 1 = helps; `significant` flags changes above measured noise |
 | `category_summary.csv` | comparison | one-glance chart: speedup at the focus workload + geomean over all |
+| `engine_matrix.csv` | (workload, metric) | the 2×2: PyTorch vs vLLM × not optimized vs optimized, with `pytorch_optimization_x`, `vllm_optimization_x`, `vllm_vs_pytorch_baseline_x`, `vllm_vs_pytorch_optimized_x`, `end_to_end_x` (×>1 = better, latencies included) |
 | `headline.csv` | (workload, anchor) | baselines vs optimized, `x_vs_pt_eager`, `x_vs_vllm_default` |
 | `ladder.csv` | (ladder, step, workload, metric) | waterfall: `step_x`, `cumulative_x`, `share_of_total_gain` |
 | `kernel_breakdown.csv` | (config, kernel class) | where the GPU time goes (with `--profile`): attention / GEMM / norm / comms / …, plus `gpu_busy_pct` |
 | `anomalies.csv` | finding | what was flagged, retried, resolved or persisting |
 | `results.csv` / `results_all.csv` | (config, workload) median / every repeat | raw medians, `n_repeats`, `cv_output_throughput` |
-| `report.md`, `plots/` | | the same, as tables and PNGs |
+| `report.md` | | the same, as tables (section 1b is the 2×2 at c=1, c=8, the reference concurrency and the text workload) |
+| `plots/` | | static PNG + SVG images of the dashboard charts (below) |
+| `dashboard.html` | | interactive optimization-frontier view (below) |
 | `summary.json`, `raw/`, `server_logs/`, `profiles/` | | environment, engine facts, untouched bench JSON, logs, traces |
+
+### `dashboard.html`: the optimization frontier
+
+Every `report` also writes `dashboard.html`, a self-contained interactive page (open it in any
+browser; no network needed) in the style of the InferenceX dashboard. Its main chart is **output
+tok/s per GPU vs interactivity (tok/s/user)**: one curve per stage, one point per concurrency
+(1 → 128), so a better stage sits up and to the right.
+
+* **Ladder:** the vLLM ladder, the PyTorch static ladder, the PyTorch serving ladder, or
+  **Engines head-to-head** (PyTorch and vLLM baselines vs fully optimized; log scale by default).
+* **Colors:** every ladder stage has its own color (fixed per stage, so it never changes between
+  views; a 9th stage reuses the first color as a dashed line). In **Engines head-to-head**, orange =
+  PyTorch and blue = vLLM, and the line style says which config: dashed = baseline, dotted = default,
+  solid = optimized.
+* **Focus:** all stages (default), first vs last, beginning stages, or end stages. Stages outside the
+  focus keep their color but fade back.
+* **Compare at:** bars for every stage at the same concurrency, or at a matched interactivity
+  (interpolated along each curve, the fair way to compare). Each bar shows `×prev`, its gain over
+  the stage before.
+* **Toggles:** shape (input/output length), x-axis (interactivity, TTFT, end-to-end latency),
+  y-axis (output or total tok/s per GPU), log scale, Pareto frontier, a table view, and light/dark.
+  Where a curve ends, the note under the chart says why (out of memory or saturated).
+* **PyTorch vs vLLM table:** the 2×2 (baseline / optimized for each engine) at any shape and
+  concurrency, with the gain from optimizing and the vLLM ÷ PyTorch ratio. "Optimized" is the
+  better of `pt_optimized` / `pt_serve_optimized` (and `vllm_optimized` / `vllm_optimized_spec`)
+  at that point; the configs that won are named under the table.
+* **Download PNG / SVG** under each chart saves exactly what is on screen (current ladder, focus,
+  axes, theme), with its title.
+
+### `plots/`: the same charts as images
+
+Every `report` also writes these (PNG for slides, SVG for papers), from the same data and colors:
+
+| image | what |
+|---|---|
+| `overview.png` | the headline charts below in one image |
+| `engine_matrix.png` | the 2×2 across concurrency (hatched = not optimized, solid = optimized; log scale) |
+| `frontier_engines.png` | PyTorch vs vLLM frontiers, baselines dashed, optimized solid |
+| `frontier_<ladder>.png` | every stage of a ladder, one color per stage, with a legend |
+| `frontier_<ladder>_first_vs_last.png` | the first and last stage highlighted, the rest faded |
+| `stages_<ladder>.png` | each stage at one concurrency, with its gain over the stage before |
+| `optimization_breakdown.png`, `kernel_breakdown.png` | every comparison's speedup; GPU time by kernel class |
+
+Images are re-made from the CSVs at any time: `./run.sh report <run_id>` (no re-run needed).
 
 `./run.sh collect` merges every run into `results/all_*.csv` for cross-hardware charts. Every row
 carries `run_id`, `hardware`, `gpu_name` and the versions.
@@ -272,6 +324,7 @@ llmbench/
   workloads.py          grids, run sizing, shared prompt generator (random / mixed / text)
   sampling.py           adaptive repeats + ETA
   tailor.py             card classification, memory reservations, OOM retries, workload fit
+  sweep.py              stop a concurrency sweep at the first OOM / saturation
   anomalies.py          the anomaly walk and retry planning
   vllm_runner.py        vllm serve lifecycle, vllm bench serve, built-in client runs, profiling
   torch_runner.py       PyTorch orchestrator (one worker process per config, crash recovery)
@@ -281,6 +334,8 @@ llmbench/
   results.py            aggregation and every CSV
   profiling.py          chrome trace -> GPU time by kernel class
   report.py             report.md and plots
+  dashboard.py          dashboard.html (interactive frontier view)
+  figures.py            plots/*.png|svg (static versions of the dashboard charts)
   checklist.py          PASS/WARN/FAIL/NOOP/SKIP functional check
   hardware.py models.py util.py
 tests/
