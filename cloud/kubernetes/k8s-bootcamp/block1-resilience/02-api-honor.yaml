@@ -1,0 +1,95 @@
+# Block 1, Step 2 FIX: baseline + nodeTaintsPolicy: Honor on the zone spread constraint.
+# Deliberate choices: no CPU limit (Block 2 topic), memory limit set (Burstable QoS),
+# native preStop sleep for endpoint propagation, PDB that lets unhealthy pods be evicted.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bootcamp
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: bootcamp
+spec:
+  replicas: 4
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      terminationGracePeriodSeconds: 30
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        nodeTaintsPolicy: Honor
+        labelSelector: { matchLabels: { app: api } }
+        matchLabelKeys: ["pod-template-hash"]
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector: { matchLabels: { app: api } }
+        matchLabelKeys: ["pod-template-hash"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+      - name: api
+        image: registry.k8s.io/e2e-test-images/agnhost:2.39
+        args: ["netexec", "--http-port=8080"]
+        ports:
+        - { name: http, containerPort: 8080 }
+        resources:
+          requests: { cpu: 50m, memory: 32Mi }
+          limits:   { memory: 64Mi }
+        startupProbe:
+          httpGet: { path: /hostname, port: http }
+          periodSeconds: 2
+          failureThreshold: 15
+        readinessProbe:
+          httpGet: { path: /hostname, port: http }
+          periodSeconds: 5
+          failureThreshold: 2
+        livenessProbe:
+          tcpSocket: { port: http }
+          periodSeconds: 10
+          failureThreshold: 3
+        lifecycle:
+          preStop:
+            sleep: { seconds: 5 }
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: { drop: ["ALL"] }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+  namespace: bootcamp
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels: { app: api }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: bootcamp
+spec:
+  selector: { app: api }
+  ports:
+  - { name: http, port: 80, targetPort: http }
