@@ -24,6 +24,20 @@ measurement and automatically re-runs the ones that look wrong.
 BG=1 ./run.sh suite  # same, detached (unified-memory boxes: add the sudoers line it prints)
 ```
 
+### Upgrading vLLM
+
+vLLM renames and removes CLI flags between releases, so treat an upgrade as its own step:
+
+```bash
+./run.sh setup                       # latest vLLM, or pin one: VLLM_VERSION=0.x.y ./run.sh setup
+./run.sh smoke                       # the stack still starts and serves
+./run.sh check                       # every config on a tiny grid; FAIL rows name rejected flags
+```
+
+Fix any rejected flags in `llmbench/configs.py` / `llmbench/vllm_runner.py` before a long run. Every
+run records the vLLM, torch, transformers, torchao, kernels, CUDA and driver versions in
+`summary.json`, so results from different versions are never mixed up.
+
 Results go to `results/<hardware>_<preset>_<timestamp>/`, e.g. `rtx4090_standard_20261024_2100`.
 Load `results_long.csv` or `optimizations.csv` into any plotting tool. `report.md` and `plots/`
 summarize the same data.
@@ -343,5 +357,6 @@ tests/
   run_tests.py          end-to-end tests against the fake vLLM and a synthetic PyTorch worker
 ```
 
-`python3 tests/run_tests.py` exercises the orchestration, client, CSVs, anomaly walk and retries
-on any machine, with no GPU and no vLLM install.
+`./run.sh test` (or `./run.sh test unit` for just the unit tests) exercises the orchestration,
+client, CSVs, anomaly walk and retries on any machine, with no GPU and no vLLM install. It uses
+`python3` if pandas and matplotlib are already importable, otherwise a throwaway `uv` environment.

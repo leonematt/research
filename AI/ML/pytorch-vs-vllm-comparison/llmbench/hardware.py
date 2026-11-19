@@ -246,6 +246,18 @@ def vllm_default_batching(hw: Optional[Hardware]) -> tuple[int, int]:
     return 2048, 256
 
 
+def _pkg_version(name: str) -> str:
+    """Installed version of `name` in this interpreter, without importing it ('' if absent)."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+        try:
+            return version(name)
+        except PackageNotFoundError:
+            return ""
+    except Exception:
+        return ""
+
+
 def environment(hw: Hardware) -> dict:
     return dict(
         timestamp=dt.datetime.now().isoformat(timespec="seconds"),
@@ -255,6 +267,8 @@ def environment(hw: Hardware) -> dict:
         torch=sh([sys.executable, "-c", "import torch;print(torch.__version__)"]),
         transformers=sh([sys.executable, "-c", "import transformers;print(transformers.__version__)"]),
         cuda=sh([sys.executable, "-c", "import torch;print(torch.version.cuda)"]),
+        # optional packages that change which PyTorch configs run (empty when not installed)
+        torchao=_pkg_version("torchao"), kernels=_pkg_version("kernels"),
         driver=sh(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]).split("\n")[0],
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
         hardware=hw.to_dict(),

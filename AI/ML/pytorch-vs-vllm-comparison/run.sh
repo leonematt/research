@@ -4,6 +4,7 @@
 # is chosen; `./run.sh list` shows exactly what this box will run.
 #
 #   ./run.sh setup              one-time: uv venv (py3.12) + vllm, accelerate, torchao, kernels, pandas, matplotlib
+#   ./run.sh test [unit]        offline tests (fake vLLM, no GPU); pulls pandas/matplotlib via uv if missing
 #   ./run.sh cuda               install the CUDA toolkit (nvcc) matching torch (sudo, apt)
 #   ./run.sh list               hardware, model, every config by tier/category, workloads
 #   ./run.sh dry                print every server / benchmark command
@@ -36,6 +37,8 @@
 #   HF_HOME=<dir>        model cache (default ~/.cache/huggingface);  HF_TOKEN for gated models
 #   OUT=<dir>            results dir (default ./results);  PORT=<n> server port (default 8031)
 #   BG=1                 detach with nohup (otherwise use tmux)
+#   VLLM_VERSION=<x.y.z> `setup` installs exactly this vLLM (default: latest); the version used is
+#                        recorded in every run's environment, so results stay attributable
 #   VLLM_VENV=<dir>      venv to activate if `vllm` isn't on PATH (default ~/venvs/vllm)
 #   DOCKER_IMAGE=<img>   run inside a vLLM container (mounts this dir at /work, $HF_HOME for models)
 set -euo pipefail
@@ -65,6 +68,18 @@ cuda_toolkit_plan() {
 }
 have_nvcc() { [[ -x "${CUDA_HOME:-/nonexistent}/bin/nvcc" ]] || command -v nvcc >/dev/null 2>&1 || [[ -x /usr/local/cuda/bin/nvcc ]]; }
 
+if [[ "$MODE" == "test" ]]; then
+  # The tests need no GPU, vLLM or torch, only pandas + matplotlib for the CSV/report code.
+  if python3 -c "import pandas, matplotlib" >/dev/null 2>&1; then
+    exec python3 tests/run_tests.py "$@"
+  elif command -v uv >/dev/null 2>&1; then
+    exec uv run --no-project --python 3.12 --with pandas --with matplotlib python tests/run_tests.py "$@"
+  elif [[ -x "$VLLM_VENV/bin/python" ]]; then
+    exec "$VLLM_VENV/bin/python" tests/run_tests.py "$@"
+  fi
+  echo "tests need pandas + matplotlib: install uv (https://docs.astral.sh/uv/) or run ./run.sh setup"; exit 1
+fi
+
 if [[ "$MODE" == "setup" || "$MODE" == "cuda" ]]; then
   command -v uv >/dev/null 2>&1 || { echo "installing uv"; curl -LsSf https://astral.sh/uv/install.sh | sh; export PATH="$HOME/.local/bin:$PATH"; }
   # Python 3.12: the newest distro Pythons (e.g. 3.14 on DGX OS) lack wheels for most ML packages
@@ -72,7 +87,9 @@ if [[ "$MODE" == "setup" || "$MODE" == "cuda" ]]; then
   # shellcheck disable=SC1091
   source "$VLLM_VENV/bin/activate"
   if [[ "$MODE" == "setup" ]]; then
-    uv pip install vllm --torch-backend=auto pandas matplotlib accelerate "$@"
+    VLLM_SPEC="vllm${VLLM_VERSION:+==$VLLM_VERSION}"
+    echo "installing $VLLM_SPEC"
+    uv pip install "$VLLM_SPEC" --torch-backend=auto pandas matplotlib accelerate "$@"
     uv pip install torchao || echo "torchao optional (pt_optimized / pt_quant_int4); skipped"
     uv pip install kernels || echo "kernels optional (pt_kernels); skipped"
   fi
@@ -123,7 +140,7 @@ case "$MODE" in
   retry|anomalies|report) ARGS=("$MODE"); [[ $# -gt 0 && "$1" != -* ]] && { ARGS+=(--run-id "$1"); shift; }
              [[ "$MODE" != retry ]] && RUNS=0 ;;
   collect)   ARGS=(collect); RUNS=0 ;;
-  *) echo "unknown mode: $MODE (setup|cuda|list|dry|smoke|check|quick|standard|full|long|suite|retry|anomalies|report|collect|custom)"; exit 1 ;;
+  *) echo "unknown mode: $MODE (setup|cuda|test|list|dry|smoke|check|quick|standard|full|long|suite|retry|anomalies|report|collect|custom)"; exit 1 ;;
 esac
 
 PY=python3
