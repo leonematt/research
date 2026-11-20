@@ -120,6 +120,7 @@ recorded in `anomalies.csv`:
 | `compiling` | torch.compile ran inside the measured window (PyTorch) | retry (the cache is warm now) |
 | `ladder` | a cumulative step is > 25% slower than the step before it | retry both steps once to confirm |
 | `server` | a vLLM server failed to start for a transient reason (timeout, memory) | retry the config |
+| `preempted` | opt-in (`--retry-preempted`): any repeat of a vLLM point had preemptions; `gpu_mem_low` is exempt (it preempts by design) | retry with 2 fresh repeats, which replace the old ones; only reported if the point looks likely to OOM (this config/shape OOMed at the same or lower concurrency, its KV demand is over 90% of the measured KV cache, or the demand can't be estimated) |
 | `oom`, `no_spec_stats` | deterministic / informational | reported |
 
 Retries are capped (`--max-retry-pairs`, default 40 per round) and ordered by severity. Each
@@ -130,7 +131,10 @@ round is re-checked afterwards:
   that config).
 
 `./run.sh retry [run_id]` runs the walk and retries on a finished run, and
-`./run.sh anomalies [run_id]` only reports.
+`./run.sh anomalies [run_id]` only reports. Add `--retry-preempted` to either one to also flag
+preempted points, for example after a run that shared the GPU:
+`./run.sh retry <run_id> --retry-preempted --max-retry-pairs 200`. Points the sweep skipped as
+"saturated" because of those preemptions stay skipped.
 
 A related safety net: if vLLM rejects one component's flag inside a composite config (say your
 version doesn't know `--no-enable-chunked-prefill`), that composite is rebuilt without the

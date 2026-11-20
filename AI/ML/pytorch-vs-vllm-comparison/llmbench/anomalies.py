@@ -20,6 +20,10 @@ no_spec_stats a speculative config reported no            report
               acceptance counters on the text workload
 server        a vLLM server failed to start for a         retry the config once
               transient-looking reason (timeout, memory)
+preempted     a repeat had vLLM preemptions               retry with 2 fresh repeats, which
+              (opt-in: --retry-preempted; gpu_mem_low     replace the old ones in results.csv;
+              preempts by design and is never flagged)    report only, if the point is likely to
+                                                          OOM / preempt again (see _oom_risk)
 
 Retries are capped (--max-retry-pairs), ordered by severity, and each round is re-checked; a
 finding that survives its retry is marked `persisting` (likely real behaviour, or a genuine
@@ -34,7 +38,9 @@ from pathlib import Path
 from .util import is_num, write_json
 
 SEVERITY = {"server": 0, "failed": 1, "impossible": 2, "incomplete": 3, "errors": 4, "partial": 5,
-            "prefix_reset": 6, "compiling": 7, "noisy": 8, "dip": 9, "ladder": 10, "oom": 20, "no_spec_stats": 21}
+            "prefix_reset": 6, "compiling": 7, "noisy": 8, "dip": 9, "ladder": 10, "preempted": 11, "oom": 20, "no_spec_stats": 21}
+EXPECTED_PREEMPTIONS = {"gpu_mem_low"}      # configs that starve the KV pool on purpose
+KV_HEADROOM = 0.9      # a preempted point is only retried if its KV demand is under this x the KV cache
 TRANSIENT_SERVER = re.compile(r"startup timeout|probe failed|Free memory on device|exited with -9|exited with 137",
                               re.I)
 
@@ -43,7 +49,32 @@ def _f(x):
     return float(x) if is_num(x) else float("nan")
 
 
-def detect(run_dir: Path, noisy_cv: float = 0.10, dip: float = 0.25) -> list[dict]:
+def _oom_risk(r: dict, df, summary: dict, wls: dict) -> str:
+    """Why re-running this preempted point would likely OOM or preempt again ('' = safe to retry).
+    Conservative: a point is only retried when we can show it fits."""
+    from .tailor import kv_demand
+
+    same_shape = df[(df["config"] == r["config"]) & (df["kind"] == r.get("kind"))
+                    & (df["input_len"] == r.get("input_len")) & (df["output_len"] == r.get("output_len"))
+                    & (df["prefix_len"].fillna(0) == (r.get("prefix_len") or 0))]
+    oom = same_shape[(same_shape["status"] == "oom")
+                     & (same_shape["concurrency"].fillna(0) <= (r.get("concurrency") or 0))]
+    if len(oom):
+        return f"OOM risk: this shape ran out of memory at c={int(oom['concurrency'].min())}"
+    w = wls.get(r["workload"])
+    if w is None or not w.closed_loop or w.kind == "sharegpt":
+        return "OOM risk unknown: KV demand can't be estimated for this workload"
+    facts = summary.get("server_facts", {})
+    cap = (facts.get(r["config"]) or {}).get("kv_cache_tokens") or (facts.get("vllm_default") or {}).get("kv_cache_tokens")
+    if not is_num(cap) or cap <= 0:
+        return "OOM risk unknown: no measured KV cache size for this config"
+    need = kv_demand(w)
+    if need > KV_HEADROOM * cap:
+        return f"OOM risk: needs ~{need:,} KV tokens in flight vs {int(cap):,} in the cache (preemption expected)"
+    return ""
+
+
+def detect(run_dir: Path, noisy_cv: float = 0.10, dip: float = 0.25, preempted: bool = False) -> list[dict]:
     import pandas as pd
 
     if not (run_dir / "results.csv").exists():
@@ -51,6 +82,10 @@ def detect(run_dir: Path, noisy_cv: float = 0.10, dip: float = 0.25) -> list[dic
     df = pd.read_csv(run_dir / "results.csv")
     summary = json.loads((run_dir / "summary.json").read_text())
     out: list[dict] = []
+    wls = {}
+    if preempted:
+        from .workloads import Workload
+        wls = {w["name"]: Workload.from_dict(w) for w in summary.get("workloads", [])}
 
     def add(r, check, detail, action="retry", extra=1):
         out.append(dict(config=r["config"], engine=r.get("engine"), workload=r["workload"],
@@ -97,6 +132,12 @@ def detect(run_dir: Path, noisy_cv: float = 0.10, dip: float = 0.25) -> list[dic
         if "speculative_decoding" in str(r.get("categories")) and r.get("engine") == "vllm" \
                 and r.get("kind") == "text" and not is_num(r.get("spec_accept_rate")):
             add(r, "no_spec_stats", "no spec-decode acceptance counters scraped", action="report", extra=0)
+        pre = _f(r.get("max_preemptions", r.get("preemptions")))
+        if preempted and r.get("config") not in EXPECTED_PREEMPTIONS and pre > 0:
+            # 2 good retry repeats supersede the old ones in results.aggregate
+            risk = _oom_risk(r, df, summary, wls)
+            add(r, "preempted", f"{pre:.0f} preemptions in the worst repeat" + (f"; not retried: {risk}" if risk else ""),
+                action="report" if risk else "retry", extra=0 if risk else 2)
 
     # throughput dips as concurrency rises (closed-loop grid points of one shape)
     ok = df[df["status"] == "ok"]

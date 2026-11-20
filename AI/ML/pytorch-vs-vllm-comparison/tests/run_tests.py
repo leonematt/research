@@ -195,6 +195,13 @@ def unit() -> None:
     agg = pd.read_csv(rd / "results.csv").iloc[0]
     check(agg["output_throughput"] == 434.0 and agg["n_repeats"] == 3 and agg["superseded_repeats"] == 3
           and agg["cv_output_throughput"] < 0.02, "median/CV come from the 3 consistent retry repeats only")
+    for rep, pre in ((0, 0.0), (1, 5.0), (2, 0.0)):
+        (rd / "raw" / f"p__w__r{rep}.row.json").write_text(_j.dumps(dict(
+            config="p", workload="w", repeat=rep, output_throughput=100.0, bench_rc=0.0, preemptions=pre)))
+    aggregate(rd)
+    agg = pd.read_csv(rd / "results.csv").set_index("config")
+    check(agg.loc["p", "preemptions"] == 0 and agg.loc["p", "max_preemptions"] == 5,
+          "max_preemptions keeps a preempted repeat the median hides")
     shutil.rmtree(rd)
 
     print("unit: anomaly walk")
@@ -216,6 +223,26 @@ def unit() -> None:
     check(("enforce_eager", "w8", "noisy") in checks, "noisy repeats flagged")
     plan = anomalies.plan_retries(found, max_pairs=2)
     check(sum(len(w) for w in plan.get("vllm", {}).values()) == 2, "retry budget respected")
+    # preempted points: KV demand is c x 2 tokens here; enforce_eager's cache holds 100 tokens
+    (run / "summary.json").write_text(json.dumps({
+        "ladders": {}, "server_facts": {"vllm_default": {"kv_cache_tokens": 10_000},
+                                        "enforce_eager": {"kv_cache_tokens": 100}},
+        "workloads": [dict(name=f"w{c}", kind="grid", input_len=1, output_len=1, concurrency=c, num_prompts=8)
+                      for c in (1, 8, 32, 128)]}))
+    df = pd.read_csv(run / "results.csv")
+    df["max_preemptions"] = 3.0                                # one preempted repeat, median still 0
+    df.loc[(df["config"] == "vllm_default") & (df["workload"] == "w32"), "status"] = "oom"
+    df = pd.concat([df, df[df["workload"] == "w1"].assign(config="gpu_mem_low")])
+    df.to_csv(run / "results.csv", index=False)
+    pre = {(f["config"], f["workload"]) for f in anomalies.detect(run) if f["check"] == "preempted"}
+    check(not pre, "preempted points not flagged without --retry-preempted")
+    pre = {(f["config"], f["workload"]): f["action"]
+           for f in anomalies.detect(run, preempted=True) if f["check"] == "preempted"}
+    retry = {k for k, v in pre.items() if v == "retry"}
+    check(retry == {("vllm_default", "w1"), ("vllm_default", "w8"), ("enforce_eager", "w1"), ("enforce_eager", "w8"),
+                    ("enforce_eager", "w32")}, "--retry-preempted retries preempted points that fit, not gpu_mem_low")
+    check(pre.get(("vllm_default", "w128")) == "report", "no retry at/after a concurrency that OOMed")
+    check(pre.get(("enforce_eager", "w128")) == "report", "no retry when KV demand exceeds the cache (256 > 0.9 x 100)")
     shutil.rmtree(run)
     shutil.rmtree(tmp)
 

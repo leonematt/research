@@ -89,6 +89,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--max-retry-pairs", type=int, default=40, help="cap on (config, workload) pairs retried per round")
     g.add_argument("--noisy-cv", type=float, default=0.10, help="anomaly: repeats disagree by more than this")
     g.add_argument("--dip", type=float, default=0.25, help="anomaly: throughput drop that counts as a dip")
+    g.add_argument("--retry-preempted", action="store_true",
+                   help="anomaly: re-run (config, workload) points where a repeat had vLLM preemptions "
+                        "(e.g. caused by GPU contention); gpu_mem_low is exempt")
     g.add_argument("--max-hours", type=float, help="skip retry rounds once the run has taken this long")
     g.add_argument("--max-batches", type=int, help="PyTorch static batching: measured batches per run (default 4)")
     g.add_argument("--warmup-prompts", type=int)
@@ -400,7 +403,7 @@ def finish(a, run_dir: Path, summary: dict, vsel, psel, wls, save_summary, t_sta
             print(f"[anomalies] --max-hours {a.max_hours} reached; skipping retry round {rnd}")
             break
         aggregate(run_dir)
-        found = anomalies.detect(run_dir, a.noisy_cv, a.dip)
+        found = anomalies.detect(run_dir, a.noisy_cv, a.dip, a.retry_preempted)
         anomalies.print_findings(found, f"round {rnd}")
         plan = anomalies.plan_retries(found, a.max_retry_pairs)
         rounds.append(dict(round=rnd, findings=found, after=None))
@@ -421,7 +424,7 @@ def finish(a, run_dir: Path, summary: dict, vsel, psel, wls, save_summary, t_sta
                 from .torch_runner import run_pytorch
                 run_pytorch(a, run_dir, sel, wls, summary, save_summary, targets=targets)
         aggregate(run_dir)
-        rounds[-1]["after"] = anomalies.detect(run_dir, a.noisy_cv, a.dip)
+        rounds[-1]["after"] = anomalies.detect(run_dir, a.noisy_cv, a.dip, a.retry_preempted)
         res = [f for f in found if f["action"] == "retry"]
         still = {(x["config"], x["workload"], x["check"]) for x in rounds[-1]["after"]}
         n_res = sum(1 for f in res if (f["config"], f["workload"], f["check"]) not in still)
@@ -429,7 +432,7 @@ def finish(a, run_dir: Path, summary: dict, vsel, psel, wls, save_summary, t_sta
     if not rounds:
         aggregate(run_dir)
         found = [dict(f, action="report") if f["action"] == "retry" else f
-                 for f in anomalies.detect(run_dir, a.noisy_cv, a.dip)]
+                 for f in anomalies.detect(run_dir, a.noisy_cv, a.dip, a.retry_preempted)]
         anomalies.print_findings(found, "walk (retries off; `retry <run_id>` re-runs these)")
         rounds.append(dict(round=0, findings=found, after=None))
     anomalies.write(run_dir, rounds)
@@ -530,7 +533,7 @@ def cmd_retry(a: argparse.Namespace, detect_only: bool = False) -> None:
     apply_summary(a, summary)
     aggregate(run_dir)
     if detect_only:
-        found = anomalies.detect(run_dir, a.noisy_cv, a.dip)
+        found = anomalies.detect(run_dir, a.noisy_cv, a.dip, a.retry_preempted)
         anomalies.print_findings(found, run_dir.name)
         anomalies.write(run_dir, [dict(round=0, findings=found, after=None)])
         return

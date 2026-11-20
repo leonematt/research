@@ -117,6 +117,9 @@ def aggregate(run_dir: Path) -> None:
         rec["cv_output_throughput"] = float(thr.std() / thr.mean()) if len(thr) >= 2 and thr.mean() else float("nan")
         rec["retried"] = int(bool(g.get("retry", pd.Series(dtype=float)).fillna(0).astype(float).sum()))
         rec["superseded_repeats"] = superseded
+        # the median hides a single preempted repeat; the anomaly walk needs the worst one
+        pre = ok["preemptions"].dropna() if "preemptions" in ok else []
+        rec["max_preemptions"] = float(pre.max()) if len(pre) else float("nan")
         out.append(rec)
     agg = pd.DataFrame(out)
     front = [c for c in ["config", "workload", "status", "n_repeats", "n_failed", "cv_output_throughput"] if c in agg]
